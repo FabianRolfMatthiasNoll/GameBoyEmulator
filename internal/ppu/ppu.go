@@ -26,27 +26,50 @@ type PPU struct {
 	dot int // dots within current line [0..455]
 
 	req InterruptRequester
+
+	// Per-scanline register snapshot captured at start of each visible line (mode 2)
+	lineRegs [154]LineRegs
+
+	// Internal window line counter (increments each line when window is active)
+	winLineCounter byte
 }
 
 func New(req InterruptRequester) *PPU { return &PPU{req: req} }
+
+// LineRegs represents the PPU-visible registers relevant for rendering a scanline.
+type LineRegs struct {
+	LCDC    byte
+	SCY     byte
+	SCX     byte
+	BGP     byte
+	OBP0    byte
+	OBP1    byte
+	WY      byte
+	WX      byte
+	WinLine byte
+}
 
 // CPURead returns bytes for VRAM, OAM, and PPU IO registers. Returns 0xFF for others.
 func (p *PPU) CPURead(addr uint16) byte {
 	switch {
 	case addr >= 0x8000 && addr <= 0x9FFF:
-	// VRAM is inaccessible to CPU during mode 3 (return 0xFF)
-	if (p.stat & 0x03) == 3 { return 0xFF }
-	return p.vram[addr-0x8000]
+		// VRAM is inaccessible to CPU during mode 3 (return 0xFF)
+		if (p.stat & 0x03) == 3 {
+			return 0xFF
+		}
+		return p.vram[addr-0x8000]
 	case addr >= 0xFE00 && addr <= 0xFE9F:
-	// OAM is inaccessible during modes 2 and 3
-	m := p.stat & 0x03
-	if m == 2 || m == 3 { return 0xFF }
-	return p.oam[addr-0xFE00]
+		// OAM is inaccessible during modes 2 and 3
+		m := p.stat & 0x03
+		if m == 2 || m == 3 {
+			return 0xFF
+		}
+		return p.oam[addr-0xFE00]
 	case addr == 0xFF40:
 		return p.lcdc
 	case addr == 0xFF41:
-	// On DMG, bit7 reads as 1; bit6..3 are enables; bit2 coincidence; bit1..0 mode
-	return 0x80 | (p.stat & 0x7F)
+		// On DMG, bit7 reads as 1; bit6..3 are enables; bit2 coincidence; bit1..0 mode
+		return 0x80 | (p.stat & 0x7F)
 	case addr == 0xFF42:
 		return p.scy
 	case addr == 0xFF43:
@@ -74,12 +97,16 @@ func (p *PPU) CPURead(addr uint16) byte {
 func (p *PPU) CPUWrite(addr uint16, value byte) {
 	switch {
 	case addr >= 0x8000 && addr <= 0x9FFF:
-	if (p.stat & 0x03) == 3 { return }
-	p.vram[addr-0x8000] = value
+		if (p.stat & 0x03) == 3 {
+			return
+		}
+		p.vram[addr-0x8000] = value
 	case addr >= 0xFE00 && addr <= 0xFE9F:
-	m := p.stat & 0x03
-	if m == 2 || m == 3 { return }
-	p.oam[addr-0xFE00] = value
+		m := p.stat & 0x03
+		if m == 2 || m == 3 {
+			return
+		}
+		p.oam[addr-0xFE00] = value
 	case addr == 0xFF40:
 		prev := p.lcdc
 		p.lcdc = value
@@ -93,6 +120,7 @@ func (p *PPU) CPUWrite(addr uint16, value byte) {
 			// Turning LCD on: start at LY=0, mode 2 (OAM)
 			p.ly = 0
 			p.dot = 0
+			p.winLineCounter = 0
 			p.setMode(2)
 			p.updateLYC()
 		}
@@ -105,6 +133,7 @@ func (p *PPU) CPUWrite(addr uint16, value byte) {
 	case addr == 0xFF44:
 		p.ly = 0
 		p.dot = 0
+		p.winLineCounter = 0
 		p.updateLYC()
 		if (p.lcdc & 0x80) != 0 {
 			p.setMode(2)
@@ -166,6 +195,7 @@ func (p *PPU) Tick(cycles int) {
 				} // STAT VBlank
 			} else if p.ly > 153 {
 				p.ly = 0
+				p.winLineCounter = 0
 			}
 			p.updateLYC()
 			// Set mode for new line start (dot=0)
@@ -173,6 +203,16 @@ func (p *PPU) Tick(cycles int) {
 				p.setMode(1)
 			} else {
 				p.setMode(2)
+				// Update window line counter for THIS line based on visibility
+				// On DMG, window display requires both BG (bit0) and window (bit5) enabled.
+				windowVisible := (p.lcdc&0x20) != 0 && (p.lcdc&0x01) != 0 && p.ly >= p.wy && p.wx <= 166
+				if windowVisible {
+					if p.ly == p.wy {
+						p.winLineCounter = 0
+					} else if p.ly > p.wy {
+						p.winLineCounter++
+					}
+				}
 			}
 		}
 	}
@@ -197,6 +237,8 @@ func (p *PPU) setMode(mode byte) {
 				p.req(1)
 			}
 		}
+	case 3: // Entering mode 3: latch per-line regs for rendering
+		p.captureLineRegs()
 	}
 }
 
@@ -211,6 +253,46 @@ func (p *PPU) updateLYC() {
 	} else {
 		p.stat &^= 1 << 2
 	}
+}
+
+func (p *PPU) captureLineRegs() {
+	if p.ly < 144 {
+		p.lineRegs[p.ly] = LineRegs{
+			LCDC:    p.lcdc,
+			SCY:     p.scy,
+			SCX:     p.scx,
+			BGP:     p.bgp,
+			OBP0:    p.obp0,
+			OBP1:    p.obp1,
+			WY:      p.wy,
+			WX:      p.wx,
+			WinLine: p.winLineCounter,
+		}
+	}
+}
+
+// LineRegs returns the captured register snapshot for a given scanline (0..153).
+func (p *PPU) LineRegs(y int) LineRegs {
+	if y < 0 || y >= len(p.lineRegs) {
+		return LineRegs{}
+	}
+	return p.lineRegs[y]
+}
+
+// RawVRAM returns VRAM bytes without CPU access restrictions; for renderer use only.
+func (p *PPU) RawVRAM(addr uint16) byte {
+	if addr >= 0x8000 && addr <= 0x9FFF {
+		return p.vram[addr-0x8000]
+	}
+	return 0xFF
+}
+
+// RawOAM returns OAM bytes without CPU access restrictions; for renderer use only.
+func (p *PPU) RawOAM(addr uint16) byte {
+	if addr >= 0xFE00 && addr <= 0xFE9F {
+		return p.oam[addr-0xFE00]
+	}
+	return 0xFF
 }
 
 // Expose palettes and scroll for renderer convenience (optional helpers)

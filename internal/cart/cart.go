@@ -9,6 +9,13 @@ type Cartridge interface {
 	Write(addr uint16, value byte)
 }
 
+// BatteryBacked is an optional interface for cartridges with external RAM to be persisted.
+// Implementations should return a copy of RAM bytes (may be empty if no RAM), and accept data to load.
+type BatteryBacked interface {
+	SaveRAM() []byte
+	LoadRAM(data []byte)
+}
+
 // NewCartridge picks an implementation based on the ROM header.
 func NewCartridge(rom []byte) Cartridge {
 	h, err := ParseHeader(rom)
@@ -21,8 +28,7 @@ func NewCartridge(rom []byte) Cartridge {
 	case 0x01, 0x02, 0x03: // MBC1 variants (RAM, RAM+BAT are transparent here)
 		return NewMBC1(rom, h.RAMSizeBytes)
 	case 0x0F, 0x10, 0x11, 0x12, 0x13: // MBC3 variants (RTC not implemented here)
-		// Use MBC1 as a placeholder until MBC3 is implemented, but prefer MBC5 if ROM is large
-		return NewMBC1(rom, h.RAMSizeBytes)
+		return NewMBC3(rom, h.RAMSizeBytes)
 	case 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E: // MBC5 variants
 		return NewMBC5(rom, h.RAMSizeBytes)
 	default:

@@ -64,6 +64,12 @@ func NewWithCartridge(c cart.Cartridge) *Bus {
 	return b
 }
 
+// PPU returns the internal PPU for read-only rendering helpers. Avoids breaking encapsulation for CPU access.
+func (b *Bus) PPU() *ppu.PPU { return b.ppu }
+
+// Cart returns the underlying cartridge for optional battery operations (read-only interface exposure).
+func (b *Bus) Cart() cart.Cartridge { return b.cart }
+
 func (b *Bus) Read(addr uint16) byte {
 	switch {
 	// Cartridge ROM and External RAM (banked) are handled by the cartridge

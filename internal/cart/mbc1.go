@@ -105,3 +105,20 @@ func (m *MBC1) effectiveROMBank() byte {
 	// Avoid forbidden banks when low5 is zero (already remapped to 1). Additional remap not strictly necessary here.
 	return bank
 }
+
+// BatteryBacked implementation
+func (m *MBC1) SaveRAM() []byte {
+	if len(m.ram) == 0 {
+		return nil
+	}
+	out := make([]byte, len(m.ram))
+	copy(out, m.ram)
+	return out
+}
+
+func (m *MBC1) LoadRAM(data []byte) {
+	if len(m.ram) == 0 || len(data) == 0 {
+		return
+	}
+	copy(m.ram, data)
+}

@@ -17,8 +17,9 @@ type Machine struct {
 	fb   []byte // RGBA 160x144*4
 	bgci []byte // background/window color index buffer (0..3) per pixel for sprite priority
 	// core components
-	bus *bus.Bus
-	cpu *cpu.CPU
+	bus     *bus.Bus
+	cpu     *cpu.CPU
+	romPath string
 }
 
 func New(cfg Config) *Machine {
@@ -45,6 +46,34 @@ func (m *Machine) LoadCartridge(rom []byte, boot []byte) error {
 	m.bus = b
 	m.cpu = c
 	return nil
+}
+
+// SaveBattery tries to persist external cartridge RAM to a provided sink via the BatteryBacked interface.
+// The actual file IO is managed by the caller (e.g., cmd/gbemu).
+func (m *Machine) SaveBattery() ([]byte, bool) {
+	if m == nil || m.bus == nil {
+		return nil, false
+	}
+	if bb, ok := m.bus.Cart().(interface{ SaveRAM() []byte }); ok {
+		data := bb.SaveRAM()
+		if len(data) == 0 {
+			return nil, false
+		}
+		return data, true
+	}
+	return nil, false
+}
+
+// LoadBattery loads external RAM bytes into the cartridge if supported.
+func (m *Machine) LoadBattery(data []byte) bool {
+	if m == nil || m.bus == nil {
+		return false
+	}
+	if bb, ok := m.bus.Cart().(interface{ LoadRAM([]byte) }); ok {
+		bb.LoadRAM(data)
+		return true
+	}
+	return false
 }
 
 func (m *Machine) StepFrame() {
@@ -101,139 +130,148 @@ func (m *Machine) renderBG() {
 	if m.bus == nil {
 		return
 	}
-	lcdc := m.bus.Read(0xFF40)
-	// If LCD off or BG disabled, screen is white and BG CI=0 everywhere (on DMG window is also disabled)
-	if (lcdc&0x80) == 0 || (lcdc&0x01) == 0 { // LCD off or BG disabled
-		for i := 0; i < len(m.fb); i += 4 {
-			m.fb[i+0] = 0xFF
-			m.fb[i+1] = 0xFF
-			m.fb[i+2] = 0xFF
-			m.fb[i+3] = 0xFF
-		}
-		// bg color index = 0 for all pixels
-		for i := range m.bgci {
-			m.bgci[i] = 0
-		}
-		return
-	}
-	scy := m.bus.Read(0xFF42)
-	scx := m.bus.Read(0xFF43)
-	bgp := m.bus.Read(0xFF47)
-	// palette mapping for color index 0..3 to DMG shade (0=white,3=black)
-	shade := func(ci byte) byte {
-		// extract 2-bit entry from BGP
-		shift := ci * 2
-		pal := (bgp >> shift) & 0x03
-		// map 00->white, 01->light gray, 10->dark gray, 11->black
-		switch pal {
-		case 0:
-			return 0xFF
-		case 1:
-			return 0xC0
-		case 2:
-			return 0x60
-		default:
-			return 0x00
-		}
-	}
-	// bg tile map base
-	bgMapBase := uint16(0x9800)
-	if (lcdc & 0x08) != 0 { // LCDC bit3
-		bgMapBase = 0x9C00
-	}
-	// tile data base mode
-	tileData8000 := (lcdc & 0x10) != 0 // true: 0x8000 indexing, false: 0x8800 signed
-
+	// We render using per-scanline snapshots captured by the PPU at mode-2 start.
+	// Fallback to live regs will be applied if snapshot is zero.
 	for y := 0; y < 144; y++ {
-		bgy := byte((uint16(scy) + uint16(y)) & 0xFF)
+		// Snapshot this line's regs
+		lr := m.bus.PPU().LineRegs(y)
+		// If snapshot is zero (e.g., before first capture), use current live regs as a fallback
+		if lr.LCDC == 0 {
+			lr.LCDC = m.bus.Read(0xFF40)
+			lr.SCY = m.bus.Read(0xFF42)
+			lr.SCX = m.bus.Read(0xFF43)
+			lr.BGP = m.bus.Read(0xFF47)
+		}
+		// If LCD off or BG disabled for this line per snapshot, paint the line white and clear bgci
+		if (lr.LCDC&0x80) == 0 || (lr.LCDC&0x01) == 0 {
+			for x := 0; x < 160; x++ {
+				i := (y*m.w + x) * 4
+				m.fb[i+0] = 0xFF
+				m.fb[i+1] = 0xFF
+				m.fb[i+2] = 0xFF
+				m.fb[i+3] = 0xFF
+				m.bgci[y*m.w+x] = 0
+			}
+			continue
+		}
+		// Compute BG source using snapshot regs for tilemap/tiledata to keep stable per-line behavior
+		bgMapBase := uint16(0x9800)
+		if (lr.LCDC & 0x08) != 0 {
+			bgMapBase = 0x9C00
+		}
+		tileData8000 := (lr.LCDC & 0x10) != 0
+		bgy := byte((uint16(lr.SCY) + uint16(y)) & 0xFF)
 		tileRow := uint16(bgy/8) * 32
 		fineY := bgy % 8
 		for x := 0; x < 160; x++ {
-			bgx := byte((uint16(scx) + uint16(x)) & 0xFF)
+			bgx := byte((uint16(lr.SCX) + uint16(x)) & 0xFF)
 			tileCol := uint16(bgx / 8)
 			tileIndexAddr := bgMapBase + tileRow + tileCol
-			tileNum := m.bus.Read(tileIndexAddr)
+			tileNum := m.bus.PPU().RawVRAM(tileIndexAddr)
 			var tileAddr uint16
 			if tileData8000 {
 				tileAddr = 0x8000 + uint16(tileNum)*16 + uint16(fineY)*2
 			} else {
-				// signed index relative to 0x9000
 				tileAddr = 0x9000 + uint16(int8(tileNum))*16 + uint16(fineY)*2
 			}
-			lo := m.bus.Read(tileAddr)
-			hi := m.bus.Read(tileAddr + 1)
+			lo := m.bus.PPU().RawVRAM(tileAddr)
+			hi := m.bus.PPU().RawVRAM(tileAddr + 1)
 			bit := 7 - (bgx % 8)
 			ci := ((hi>>bit)&1)<<1 | ((lo >> bit) & 1)
+			// map BG color using the snapshot palette
+			bgp := lr.BGP
+			shade := func(ci byte) byte {
+				shift := ci * 2
+				pal := (bgp >> shift) & 0x03
+				switch pal {
+				case 0:
+					return 0xFF
+				case 1:
+					return 0xC0
+				case 2:
+					return 0x60
+				default:
+					return 0x00
+				}
+			}
 			s := shade(ci)
 			i := (y*m.w + x) * 4
 			m.fb[i+0] = s
 			m.fb[i+1] = s
 			m.fb[i+2] = s
 			m.fb[i+3] = 0xFF
-			// record BG color index for priority with sprites
 			m.bgci[y*m.w+x] = ci
 		}
 	}
 }
 
-// Window rendering (BG-like but with separate tilemap and WX/WY offsets)
 func (m *Machine) renderWindow() {
 	if m.bus == nil {
 		return
 	}
-	lcdc := m.bus.Read(0xFF40)
-	if (lcdc & 0x80) == 0 {
-		return
-	} // LCD off
-	if (lcdc & 0x01) == 0 {
-		return
-	} // BG disabled disables window on DMG
-	if (lcdc & 0x20) == 0 {
-		return
-	} // window disabled
-	wy := int(m.bus.Read(0xFF4A))
-	wx := int(m.bus.Read(0xFF4B)) - 7
-	if wy >= 144 || wx >= 160 {
-		return
-	}
-	bgp := m.bus.Read(0xFF47)
-	shade := func(ci byte) byte {
-		shift := ci * 2
-		pal := (bgp >> shift) & 0x03
-		switch pal {
-		case 0:
-			return 0xFF
-		case 1:
-			return 0xC0
-		case 2:
-			return 0x60
-		default:
-			return 0x00
+	// Render per-line using snapshots; do not early-return based on live regs to preserve mid-frame changes
+	for y := 0; y < 144; y++ {
+		// Snapshot this line
+		lr := m.bus.PPU().LineRegs(y)
+		if lr.LCDC == 0 {
+			// Fallback to live regs if snapshot missing
+			lr.LCDC = m.bus.Read(0xFF40)
+			lr.WY = m.bus.Read(0xFF4A)
+			lr.WX = m.bus.Read(0xFF4B)
+			lr.BGP = m.bus.Read(0xFF47)
 		}
-	}
-	winMapBase := uint16(0x9800)
-	if (lcdc & 0x40) != 0 { // bit6
-		winMapBase = 0x9C00
-	}
-	tileData8000 := (lcdc & 0x10) != 0
-
-	for y := wy; y < 144; y++ {
-		winY := byte(y - wy)
+		// Window is only considered if LCD on, BG enabled (DMG), and Window enabled for this line
+		if (lr.LCDC&0x80) == 0 || (lr.LCDC&0x01) == 0 || (lr.LCDC&0x20) == 0 {
+			continue
+		}
+		// Enforce window appears only when current line has reached WY
+		if y < int(lr.WY) || int(lr.WY) >= 144 {
+			continue
+		}
+		// Compute per-line window X start from snapshot (WX-7)
+		winXStart := int(lr.WX) - 7
+		if winXStart >= 160 {
+			continue
+		}
+		// Tile selection uses per-line snapshot LCDC for stable behavior
+		winMapBase := uint16(0x9800)
+		if (lr.LCDC & 0x40) != 0 {
+			winMapBase = 0x9C00
+		}
+		tileData8000 := (lr.LCDC & 0x10) != 0
+		// Use the PPU's internal window line counter for Y within the window
+		winY := lr.WinLine
 		tileRow := uint16(winY/8) * 32
 		fineY := winY % 8
-		for x := max(0, wx); x < 160; x++ {
-			winX := byte(x - wx)
+		// Palette snapshot
+		bgp := lr.BGP
+		shade := func(ci byte) byte {
+			shift := ci * 2
+			pal := (bgp >> shift) & 0x03
+			switch pal {
+			case 0:
+				return 0xFF
+			case 1:
+				return 0xC0
+			case 2:
+				return 0x60
+			default:
+				return 0x00
+			}
+		}
+		for x := max(0, winXStart); x < 160; x++ {
+			winX := byte(x - winXStart)
 			tileCol := uint16(winX / 8)
 			tileIndexAddr := winMapBase + tileRow + tileCol
-			tileNum := m.bus.Read(tileIndexAddr)
+			tileNum := m.bus.PPU().RawVRAM(tileIndexAddr)
 			var tileAddr uint16
 			if tileData8000 {
 				tileAddr = 0x8000 + uint16(tileNum)*16 + uint16(fineY)*2
 			} else {
 				tileAddr = 0x9000 + uint16(int8(tileNum))*16 + uint16(fineY)*2
 			}
-			lo := m.bus.Read(tileAddr)
-			hi := m.bus.Read(tileAddr + 1)
+			lo := m.bus.PPU().RawVRAM(tileAddr)
+			hi := m.bus.PPU().RawVRAM(tileAddr + 1)
 			bit := 7 - (winX % 8)
 			ci := ((hi>>bit)&1)<<1 | ((lo >> bit) & 1)
 			s := shade(ci)
@@ -242,28 +280,17 @@ func (m *Machine) renderWindow() {
 			m.fb[i+1] = s
 			m.fb[i+2] = s
 			m.fb[i+3] = 0xFF
-			// window is part of BG layer for priority decisions
 			m.bgci[y*m.w+x] = ci
 		}
 	}
 }
 
-// Sprite rendering (8x8 only; ignores 8x16 for now). Honors OBP0/OBP1 and basic priority.
+// Sprite rendering with 8x8 and 8x16 support. Honors OBP0/OBP1 and BG priority via bgci.
 func (m *Machine) renderSprites() {
 	if m.bus == nil {
 		return
 	}
-	lcdc := m.bus.Read(0xFF40)
-	if (lcdc & 0x80) == 0 {
-		return
-	} // LCD off
-	if (lcdc & 0x02) == 0 {
-		return
-	} // OBJ disabled
-	// sprite size (false:8x8, true:8x16)
-	sprite16 := (lcdc & 0x04) != 0
-	obp0 := m.bus.Read(0xFF48)
-	obp1 := m.bus.Read(0xFF49)
+	// We'll use per-line snapshots for LCDC and palettes
 	shadeP := func(pal byte, ci byte) byte {
 		shift := ci * 2
 		p := (pal >> shift) & 0x03
@@ -279,86 +306,123 @@ func (m *Machine) renderSprites() {
 		}
 	}
 
-	// For each scanline, we could limit to 10 sprites; here, keep it simple and approximate
+	type oamEntry struct {
+		sy, sx     int
+		tile, attr byte
+		index      int
+	}
 	for y := 0; y < 144; y++ {
-		// Gather candidate sprites for this line in OAM order (priority).
-		candidates := make([][4]byte, 0, 10)
+		lr := m.bus.PPU().LineRegs(y)
+		lcdc := lr.LCDC
+		if lcdc == 0 {
+			lcdc = m.bus.Read(0xFF40)
+		}
+		if (lcdc & 0x80) == 0 {
+			continue
+		} // LCD off
+		if (lcdc & 0x02) == 0 {
+			continue
+		} // OBJ disabled
+		// sprite size for this line
+		sprite16 := (lcdc & 0x04) != 0
+		obp0 := lr.OBP0
+		obp1 := lr.OBP1
+		if lr.LCDC == 0 { // fallback to live palettes if snapshot missing
+			obp0 = m.bus.Read(0xFF48)
+			obp1 = m.bus.Read(0xFF49)
+		}
+		// Gather up to 10 candidate sprites for this scanline in OAM order
+		candidates := make([]oamEntry, 0, 10)
 		for i := 0; i < 40 && len(candidates) < 10; i++ {
 			base := uint16(0xFE00 + i*4)
-			sy := int(m.bus.Read(base)) - 16
-			sx := int(m.bus.Read(base+1)) - 8
-			tile := m.bus.Read(base + 2)
-			attr := m.bus.Read(base + 3)
+			sy := int(m.bus.PPU().RawOAM(base)) - 16
+			sx := int(m.bus.PPU().RawOAM(base+1)) - 8
+			tile := m.bus.PPU().RawOAM(base + 2)
+			attr := m.bus.PPU().RawOAM(base + 3)
 			height := 8
 			if sprite16 {
 				height = 16
 			}
 			if sy <= y && y < sy+height {
-				candidates = append(candidates, [4]byte{byte(sy), byte(sx), tile, attr})
+				candidates = append(candidates, oamEntry{sy: sy, sx: sx, tile: tile, attr: attr, index: i})
 			}
 		}
 		if len(candidates) == 0 {
 			continue
 		}
+		// Stable sort by X ascending, then by OAM index to implement leftmost-X tie-breaker
+		// (11 objects are never considered; we already capped to 10)
+		for i := 0; i < len(candidates); i++ {
+			for j := i + 1; j < len(candidates); j++ {
+				if candidates[j].sx < candidates[i].sx || (candidates[j].sx == candidates[i].sx && candidates[j].index < candidates[i].index) {
+					candidates[i], candidates[j] = candidates[j], candidates[i]
+				}
+			}
+		}
 		for x := 0; x < 160; x++ {
-			// Draw first visible, non-zero pixel that respects priority
+			bestFound := false
+			bestX := 0
+			bestIdx := 0
+			bestGray := byte(0)
 			for _, s := range candidates {
-				sy := int(int8(s[0])) // stored as byte but already adjusted
-				sx := int(int8(s[1]))
-				tile := s[2]
-				attr := s[3]
+				sy := s.sy
+				sx := s.sx
+				tile := s.tile
+				attr := s.attr
 				if x < sx || x >= sx+8 {
 					continue
 				}
-				// row/col within the sprite
+				// OBJ-to-BG priority: if bit7 set and BG/window pixel is non-zero, skip drawing
+				if (attr & (1 << 7)) != 0 {
+					if m.bgci[y*m.w+x] != 0 {
+						continue
+					}
+				}
 				row := int(y - sy)
 				col := int(x - sx)
-				// flips
-				if (attr & (1 << 6)) != 0 { // Y flip
+				if (attr & (1 << 6)) != 0 {
 					if sprite16 {
 						row = 15 - row
 					} else {
 						row = 7 - row
 					}
 				}
-				if (attr & (1 << 5)) != 0 { // X flip
+				if (attr & (1 << 5)) != 0 {
 					col = 7 - col
 				}
-				// fetch tile row, handling 8x16 sprites (tile index LSB ignored)
 				tIndex := tile
 				if sprite16 {
-					tIndex &= 0xFE // ignore LSB
+					tIndex &= 0xFE
 					if row >= 8 {
 						tIndex++
 					}
 				}
 				rowWithin := row & 7
 				tileAddr := uint16(0x8000) + uint16(tIndex)*16 + uint16(rowWithin)*2
-				lo := m.bus.Read(tileAddr)
-				hi := m.bus.Read(tileAddr + 1)
+				lo := m.bus.PPU().RawVRAM(tileAddr)
+				hi := m.bus.PPU().RawVRAM(tileAddr + 1)
 				bit := 7 - byte(col%8)
 				ci := ((hi>>bit)&1)<<1 | ((lo >> bit) & 1)
-				if ci == 0 { // color 0 is transparent for OBJ
+				if ci == 0 {
 					continue
 				}
-				// priority: if attr bit7 set and BG pixel is not color 0, skip drawing
-				if (attr & (1 << 7)) != 0 {
-					// check bg/window color index buffer
-					if m.bgci[y*m.w+x] != 0 {
-						continue
+				if !bestFound || sx < bestX || (sx == bestX && s.index < bestIdx) {
+					pal := obp0
+					if (attr & (1 << 4)) != 0 {
+						pal = obp1
 					}
+					bestGray = shadeP(pal, ci)
+					bestX = sx
+					bestIdx = s.index
+					bestFound = true
 				}
-				pal := obp0
-				if (attr & (1 << 4)) != 0 {
-					pal = obp1
-				}
-				sgray := shadeP(pal, ci)
+			}
+			if bestFound {
 				i := (y*m.w + x) * 4
-				m.fb[i+0] = sgray
-				m.fb[i+1] = sgray
-				m.fb[i+2] = sgray
+				m.fb[i+0] = bestGray
+				m.fb[i+1] = bestGray
+				m.fb[i+2] = bestGray
 				m.fb[i+3] = 0xFF
-				break // done for this pixel
 			}
 		}
 	}
@@ -370,5 +434,3 @@ func max(a, b int) int {
 	}
 	return b
 }
-
-// func (m *Machine) DrainAudio(max int) []float32 { ... later ... }

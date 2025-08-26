@@ -83,3 +83,20 @@ func (m *MBC5) Write(addr uint16, value byte) {
 		}
 	}
 }
+
+// BatteryBacked implementation
+func (m *MBC5) SaveRAM() []byte {
+	if len(m.ram) == 0 {
+		return nil
+	}
+	out := make([]byte, len(m.ram))
+	copy(out, m.ram)
+	return out
+}
+
+func (m *MBC5) LoadRAM(data []byte) {
+	if len(m.ram) == 0 || len(data) == 0 {
+		return
+	}
+	copy(m.ram, data)
+}
