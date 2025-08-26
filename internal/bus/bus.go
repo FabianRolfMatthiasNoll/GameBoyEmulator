@@ -28,6 +28,7 @@ type Bus struct {
 	// JOYP and Timers (scaffold only; ticking not implemented yet)
 	joypSelect byte // bits 5-4 as last written
 	joypad     byte // bitmask of pressed buttons (1=pressed), see constants below
+	joypLower4 byte // last computed lower 4 bits (active-low) for interrupt edge detection
 
 	div  byte // FF04 (upper 8 bits of internal divider)
 	tima byte // FF05
@@ -210,6 +211,7 @@ func (b *Bus) Write(addr uint16, value byte) {
 	// IO: JOYP at 0xFF00
 	case addr == 0xFF00:
 		b.joypSelect = value & 0x30
+		b.updateJoypadIRQ()
 		return
 	// IO: Timers
 	case addr == 0xFF04:
@@ -295,6 +297,7 @@ const (
 // Pass a mask using the Joyp* constants above; set bits mean pressed.
 func (b *Bus) SetJoypadState(mask byte) {
 	b.joypad = mask
+	b.updateJoypadIRQ()
 }
 
 // SetSerialWriter sets a sink that receives bytes written via the serial port.
@@ -364,3 +367,44 @@ func (b *Bus) incrementTIMA() {
 
 // PPU step: very simplified mode scheduling and LY counter
 // PPU-specific helpers moved to internal/ppu
+
+// updateJoypadIRQ recomputes JOYP lower 4 bits (active-low) and raises IF bit 4 on any 1->0 transition.
+func (b *Bus) updateJoypadIRQ() {
+	newLower := byte(0x0F)
+	// P14 low selects D-Pad
+	if (b.joypSelect & 0x10) == 0 {
+		if b.joypad&JoypRight != 0 {
+			newLower &^= 0x01
+		}
+		if b.joypad&JoypLeft != 0 {
+			newLower &^= 0x02
+		}
+		if b.joypad&JoypUp != 0 {
+			newLower &^= 0x04
+		}
+		if b.joypad&JoypDown != 0 {
+			newLower &^= 0x08
+		}
+	}
+	// P15 low selects Buttons
+	if (b.joypSelect & 0x20) == 0 {
+		if b.joypad&JoypA != 0 {
+			newLower &^= 0x01
+		}
+		if b.joypad&JoypB != 0 {
+			newLower &^= 0x02
+		}
+		if b.joypad&JoypSelectBtn != 0 {
+			newLower &^= 0x04
+		}
+		if b.joypad&JoypStart != 0 {
+			newLower &^= 0x08
+		}
+	}
+	// Edge: previously 1, now 0 -> trigger IF bit 4
+	falling := b.joypLower4 &^ newLower
+	if falling != 0 {
+		b.ifReg |= 1 << 4
+	}
+	b.joypLower4 = newLower
+}
