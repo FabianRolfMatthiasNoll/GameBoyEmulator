@@ -1,0 +1,15 @@
+# Go / editor
+bin/
+*.exe
+*.out
+*.test
+.idea/ .vscode/ .DS_Store
+
+# Emu data
+*.sav
+*.state
+testroms/*.gb
+testroms/*.gbc
+
+testroms/**/*.gb
+testroms/**/*.gbc
