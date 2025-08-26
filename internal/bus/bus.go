@@ -4,6 +4,7 @@ import (
 	"io"
 
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/cart"
+	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/ppu"
 )
 
 // Bus wires CPU-visible address space to cartridge, WRAM, HRAM, and IO.
@@ -17,9 +18,8 @@ type Bus struct {
 	// High RAM (HRAM) 0xFF80–0xFFFE (127 bytes)
 	hram [0x7F]byte
 
-	// Video RAM and OAM (no PPU timing restrictions yet)
-	vram [0x2000]byte // 0x8000–0x9FFF
-	oam  [0xA0]byte   // 0xFE00–0xFE9F
+	// PPU encapsulates VRAM/OAM and LCDC/STAT timing
+	ppu *ppu.PPU
 
 	// Interrupt registers
 	ie    byte // IE at 0xFFFF
@@ -42,32 +42,26 @@ type Bus struct {
 	// Internal 16-bit divider that increments every T-cycle; DIV reads upper 8 bits
 	divInternal uint16
 
-	// LCD/PPU registers and state (minimal)
-	lcdc byte // FF40
-	stat byte // FF41 (mode bits 0-1, coincidence flag bit2, and interrupt enables bits 3-6)
-	scy  byte // FF42
-	scx  byte // FF43
-	ly   byte // FF44 (read-only, write resets to 0)
-	lyc  byte // FF45
-	dma  byte // FF46
-	bgp  byte // FF47
-	obp0 byte // FF48
-	obp1 byte // FF49
-	wy   byte // FF4A
-	wx   byte // FF4B
+	// DMA register (still handled here for copy trigger)
+	dma byte // FF46
 
-	// PPU timing
-	ppuDotCounter int // cycles within current line [0..455]
+	// OAM DMA state
+	dmaActive bool
+	dmaSrc    uint16
+	dmaIndex  int
 }
 
 // New constructs a Bus with a ROM-only cartridge for convenience.
 func New(rom []byte) *Bus {
-	return NewWithCartridge(cart.NewROMOnly(rom))
+	return NewWithCartridge(cart.NewCartridge(rom))
 }
 
 // NewWithCartridge wires a provided cartridge implementation.
 func NewWithCartridge(c cart.Cartridge) *Bus {
-	return &Bus{cart: c}
+	b := &Bus{cart: c}
+	// hook PPU to request IF bits through bus
+	b.ppu = ppu.New(func(bit int) { b.ifReg |= 1 << bit })
+	return b
 }
 
 func (b *Bus) Read(addr uint16) byte {
@@ -75,9 +69,9 @@ func (b *Bus) Read(addr uint16) byte {
 	// Cartridge ROM and External RAM (banked) are handled by the cartridge
 	case addr < 0x8000:
 		return b.cart.Read(addr)
-	// VRAM
+	// VRAM (via PPU)
 	case addr >= 0x8000 && addr <= 0x9FFF:
-		return b.vram[addr-0x8000]
+		return b.ppu.CPURead(addr)
 	case addr >= 0xA000 && addr <= 0xBFFF:
 		return b.cart.Read(addr)
 
@@ -93,9 +87,12 @@ func (b *Bus) Read(addr uint16) byte {
 	// High RAM 0xFF80–0xFFFE (IE at 0xFFFF not covered yet)
 	case addr >= 0xFF80 && addr <= 0xFFFE:
 		return b.hram[addr-0xFF80]
-	// OAM
+	// OAM via PPU (reads blocked during DMA)
 	case addr >= 0xFE00 && addr <= 0xFE9F:
-		return b.oam[addr-0xFE00]
+		if b.dmaActive {
+			return 0xFF
+		}
+		return b.ppu.CPURead(addr)
 	// IO: JOYP at 0xFF00
 	case addr == 0xFF00:
 		// Upper bits 7-6 read as 1, bits 5-4 reflect selection, bits 3-0 depend on selected group(s)
@@ -147,32 +144,14 @@ func (b *Bus) Read(addr uint16) byte {
 	case addr == 0xFF02:
 		// upper bits read as 1 except bit7 reflects transfer in progress; we complete immediately
 		return 0x7E | (b.sc & 0x81)
-	// LCDC/STAT/LY/LYC and scroll/window
-	case addr == 0xFF40:
-		return b.lcdc
-	case addr == 0xFF41:
-		// Compose STAT: upper bits as stored enables (3-6), bit2 coinc., bits1-0 mode
-		return (b.stat & 0xF8) | (b.stat & 0x07)
-	case addr == 0xFF42:
-		return b.scy
-	case addr == 0xFF43:
-		return b.scx
-	case addr == 0xFF44:
-		return b.ly
-	case addr == 0xFF45:
-		return b.lyc
+	// LCDC/STAT/LY/LYC and scroll/window via PPU
+	case addr == 0xFF40, addr == 0xFF41, addr == 0xFF42, addr == 0xFF43,
+		addr == 0xFF44, addr == 0xFF45,
+		addr == 0xFF47, addr == 0xFF48, addr == 0xFF49,
+		addr == 0xFF4A, addr == 0xFF4B:
+		return b.ppu.CPURead(addr)
 	case addr == 0xFF46:
 		return b.dma
-	case addr == 0xFF47:
-		return b.bgp
-	case addr == 0xFF48:
-		return b.obp0
-	case addr == 0xFF49:
-		return b.obp1
-	case addr == 0xFF4A:
-		return b.wy
-	case addr == 0xFF4B:
-		return b.wx
 	// IO: IF at 0xFF0F, other IO not implemented (return 0xFF)
 	case addr == 0xFF0F:
 		return 0xE0 | (b.ifReg & 0x1F)
@@ -190,9 +169,9 @@ func (b *Bus) Write(addr uint16, value byte) {
 	case addr < 0x8000:
 		b.cart.Write(addr, value)
 		return
-	// VRAM
+	// VRAM via PPU
 	case addr >= 0x8000 && addr <= 0x9FFF:
-		b.vram[addr-0x8000] = value
+		b.ppu.CPUWrite(addr, value)
 		return
 	case addr >= 0xA000 && addr <= 0xBFFF:
 		b.cart.Write(addr, value)
@@ -215,9 +194,12 @@ func (b *Bus) Write(addr uint16, value byte) {
 	case addr >= 0xFF80 && addr <= 0xFFFE:
 		b.hram[addr-0xFF80] = value
 		return
-	// OAM
+	// OAM via PPU (writes ignored during DMA)
 	case addr >= 0xFE00 && addr <= 0xFE9F:
-		b.oam[addr-0xFE00] = value
+		if b.dmaActive {
+			return
+		}
+		b.ppu.CPUWrite(addr, value)
 		return
 	// IO: JOYP at 0xFF00
 	case addr == 0xFF00:
@@ -265,59 +247,19 @@ func (b *Bus) Write(addr uint16, value byte) {
 			b.sc &^= 0x80
 		}
 		return
-	// LCDC/STAT/LY/LYC and scroll/window
-	case addr == 0xFF40:
-		prev := b.lcdc
-		b.lcdc = value
-		// If LCD is turned off (bit7=0), reset LY/mode
-		if (b.lcdc&0x80) == 0 && (prev&0x80) != 0 {
-			b.ly = 0
-			b.ppuDotCounter = 0
-			b.setPPUMode(0) // HBlank
-		}
-		return
-	case addr == 0xFF41:
-		// Only bits 3-6 are interrupt enables; lower bits are status and coincidence flag
-		b.stat = (b.stat & 0x07) | (value & 0x78)
-		return
-	case addr == 0xFF42:
-		b.scy = value
-		return
-	case addr == 0xFF43:
-		b.scx = value
-		return
-	case addr == 0xFF44:
-		// Writing any value resets LY to 0
-		b.ly = 0
-		b.ppuDotCounter = 0
-		b.updateLYC()
-		return
-	case addr == 0xFF45:
-		b.lyc = value
-		b.updateLYC()
+	// LCDC/STAT/LY/LYC and scroll/window via PPU
+	case addr == 0xFF40, addr == 0xFF41, addr == 0xFF42, addr == 0xFF43,
+		addr == 0xFF44, addr == 0xFF45,
+		addr == 0xFF47, addr == 0xFF48, addr == 0xFF49,
+		addr == 0xFF4A, addr == 0xFF4B:
+		b.ppu.CPUWrite(addr, value)
 		return
 	case addr == 0xFF46:
-		// OAM DMA: copy 160 bytes from value*0x100 to FE00
+		// OAM DMA: initiate 160-byte transfer from value*0x100 to FE00, 1 byte per cycle
 		b.dma = value
-		base := uint16(value) << 8
-		for i := 0; i < 0xA0; i++ {
-			b.oam[i] = b.Read(base + uint16(i))
-		}
-		return
-	case addr == 0xFF47:
-		b.bgp = value
-		return
-	case addr == 0xFF48:
-		b.obp0 = value
-		return
-	case addr == 0xFF49:
-		b.obp1 = value
-		return
-	case addr == 0xFF4A:
-		b.wy = value
-		return
-	case addr == 0xFF4B:
-		b.wx = value
+		b.dmaActive = true
+		b.dmaSrc = uint16(value) << 8
+		b.dmaIndex = 0
 		return
 	// IO: IF at 0xFF0F
 	case addr == 0xFF0F:
@@ -367,7 +309,22 @@ func (b *Bus) Tick(cycles int) {
 		if oldInput && !newInput {
 			b.incrementTIMA()
 		}
-	b.stepPPU()
+		// Tick PPU via module
+		if b.ppu != nil {
+			b.ppu.Tick(1)
+		}
+
+		// Step OAM DMA (1 byte per cycle) if active
+		if b.dmaActive {
+			if b.dmaIndex < 0xA0 {
+				v := b.Read(b.dmaSrc + uint16(b.dmaIndex))
+				b.ppu.CPUWrite(0xFE00+uint16(b.dmaIndex), v)
+				b.dmaIndex++
+			}
+			if b.dmaIndex >= 0xA0 {
+				b.dmaActive = false
+			}
+		}
 	}
 }
 
@@ -400,78 +357,4 @@ func (b *Bus) incrementTIMA() {
 }
 
 // PPU step: very simplified mode scheduling and LY counter
-func (b *Bus) stepPPU() {
-	if (b.lcdc & 0x80) == 0 { // LCD off
-		return
-	}
-	b.ppuDotCounter++
-	// Mode scheduling per line (456 dots)
-	var mode byte
-	if b.ly >= 144 {
-		mode = 1 // VBlank
-	} else {
-		switch {
-		case b.ppuDotCounter < 80:
-			mode = 2 // OAM
-		case b.ppuDotCounter < 80+172:
-			mode = 3 // Transfer
-		default:
-			mode = 0 // HBlank
-		}
-	}
-	b.setPPUMode(mode)
-
-	if b.ppuDotCounter >= 456 {
-		b.ppuDotCounter = 0
-		b.ly++
-		if b.ly == 144 {
-			// Enter VBlank
-			b.ifReg |= 1 << 0 // VBlank IF
-			// STAT VBlank interrupt if enabled (bit 4)
-			if (b.stat & (1 << 4)) != 0 {
-				b.ifReg |= 1 << 1
-			}
-		} else if b.ly > 153 {
-			b.ly = 0
-		}
-		b.updateLYC()
-	}
-}
-
-func (b *Bus) setPPUMode(mode byte) {
-	prev := b.stat & 0x03
-	if prev == mode {
-		return
-	}
-	b.stat = (b.stat &^ 0x03) | (mode & 0x03)
-	// STAT interrupts on mode change if enabled:
-	// bit3 HBlank for mode0, bit4 VBlank for mode1 (handled on vblank enter), bit5 OAM for mode2
-	switch mode {
-	case 0: // HBlank
-		if (b.stat & (1 << 3)) != 0 {
-			b.ifReg |= 1 << 1
-		}
-	case 2: // OAM
-		if (b.stat & (1 << 5)) != 0 {
-			b.ifReg |= 1 << 1
-		}
-	}
-}
-
-func (b *Bus) updateLYC() {
-	// Update coincidence flag (bit2) and request STAT if enabled (bit6) when equal
-	coinc := byte(0)
-	if b.ly == b.lyc {
-		coinc = 1
-	}
-	// set/clear bit2
-	if coinc == 1 {
-		// set coincidence flag
-		b.stat |= 1 << 2
-		if (b.stat & (1 << 6)) != 0 { // LYC=LY interrupt enable
-			b.ifReg |= 1 << 1
-		}
-	} else {
-		b.stat &^= 1 << 2
-	}
-}
+// PPU-specific helpers moved to internal/ppu
