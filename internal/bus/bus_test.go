@@ -127,6 +127,35 @@ func TestBus_SerialImmediate(t *testing.T) {
 	}
 }
 
+func TestBus_TimerEdge_OnDIVAndTACWrites(t *testing.T) {
+	b := New(make([]byte, 0x8000))
+	// Enable timer, select input from bit3 (TAC=01)
+	b.tac = 0x05
+	// Case 1: DIV write causing falling edge increments TIMA
+	b.tima = 0x10
+	b.divInternal = 0x0008 // bit3=1 -> input=true when enabled
+	if !b.timerInput() {
+		t.Fatalf("expected timerInput true")
+	}
+	b.Write(0xFF04, 0x00) // reset DIV -> input goes false -> increment
+	if got := b.tima; got != 0x11 {
+		t.Fatalf("TIMA not incremented on DIV falling edge: got %02X want 11", got)
+	}
+
+	// Case 2: TAC change causing falling edge increments TIMA
+	b.tima = 0x20
+	b.divInternal = 0x0008 // bit3=1 (true)
+	b.tac = 0x05           // enable + 01 (bit3)
+	if !b.timerInput() {
+		t.Fatalf("expected timerInput true before TAC change")
+	}
+	// Change to select bit5 which is 0 with current divider -> falling edge
+	b.Write(0xFF07, 0x06) // enable + 10 (bit5)
+	if got := b.tima; got != 0x21 {
+		t.Fatalf("TIMA not incremented on TAC falling edge: got %02X want 21", got)
+	}
+}
+
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

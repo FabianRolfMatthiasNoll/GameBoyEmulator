@@ -17,6 +17,8 @@ type CPU struct {
 
 	IME    bool
 	halted bool
+	// EI enables IME after the following instruction
+	eiPending bool
 
 	bus *bus.Bus
 }
@@ -42,6 +44,7 @@ func (c *CPU) ResetNoBoot() {
 	c.SP = 0xFFFE
 	c.IME = false
 	c.halted = false
+	c.eiPending = false
 }
 
 // Flags helpers
@@ -196,10 +199,69 @@ func (c *CPU) pop16() uint16 {
 }
 
 // Step executes one instruction and returns an approximate cycle count for the implemented subset.
-func (c *CPU) Step() int {
-	if c.halted {
-		return 4
+func (c *CPU) Step() (cycles int) {
+	// Advance timers on return with the cycles consumed in this step
+	defer func() {
+		if c.bus != nil && cycles > 0 {
+			c.bus.Tick(cycles)
+		}
+		// Apply EI delayed enable after completing this instruction
+		if c.eiPending {
+			c.IME = true
+			c.eiPending = false
+		}
+	}()
+
+	// Interrupt servicing helper
+	serviceInterrupt := func() int {
+		ie := c.bus.Read(0xFFFF)
+		ifReg := c.bus.Read(0xFF0F) & 0x1F
+		pending := ie & ifReg
+		if pending == 0 {
+			return 0
+		}
+		// priority order VBlank(0), LCD STAT(1), Timer(2), Serial(3), Joypad(4)
+		var bit uint
+		for bit = 0; bit < 5; bit++ {
+			if (pending & (1 << bit)) != 0 {
+				break
+			}
+		}
+		// acknowledge: clear IF bit
+		c.bus.Write(0xFF0F, (ifReg&^(1<<bit))&0x1F)
+		// push PC and jump
+		c.halted = false
+		c.IME = false
+		c.push16(c.PC)
+		c.PC = 0x40 + uint16(bit)*8
+		return 20
 	}
+
+	// HALT behavior: if IME and an interrupt is pending, service it; else sleep
+	if c.halted {
+		if c.IME {
+			if cyc := serviceInterrupt(); cyc != 0 {
+				return cyc
+			}
+		} else {
+			// wake on pending interrupt without servicing (HALT bug simplified)
+			ifReg := c.bus.Read(0xFF0F) & 0x1F
+			ie := c.bus.Read(0xFFFF)
+			if (ifReg & ie) != 0 {
+				c.halted = false
+			} else {
+				return 4
+			}
+		}
+	}
+
+	// If IME and an interrupt is pending, service before executing opcode
+	if c.IME {
+		if cyc := serviceInterrupt(); cyc != 0 {
+			return cyc
+		}
+	}
+
 	op := c.fetch8()
 	switch op {
 	case 0x00: // NOP
@@ -1065,11 +1127,12 @@ func (c *CPU) Step() int {
 		return 16
 
 	// EI/DI
-	case 0xF3:
+	case 0xF3: // DI
 		c.IME = false
+		c.eiPending = false
 		return 4
-	case 0xFB:
-		c.IME = true
+	case 0xFB: // EI (enable after following instruction)
+		c.eiPending = true
 		return 4
 
 	// CB prefix
@@ -1216,7 +1279,8 @@ func (c *CPU) Step() int {
 		c.setHL(c.pop16())
 		return 12
 
-	case 0x76: // HALT (temporary: treat as NOP until interrupts are wired)
+	case 0x76: // HALT
+		c.halted = true
 		return 4
 
 	default:

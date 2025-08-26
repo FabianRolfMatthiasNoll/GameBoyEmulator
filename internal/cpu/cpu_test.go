@@ -151,3 +151,41 @@ func TestCPU_CALL_RET(t *testing.T) {
 		t.Fatalf("RET did not return to 0003; PC=%04x cyc=%d", c.PC, retCycles)
 	}
 }
+
+func TestCPU_InterruptServiceAndHALT(t *testing.T) {
+	// ROM with NOPs; we’ll manually set IF/IE and IME
+	rom := make([]byte, 0x8000)
+	b := bus.New(rom)
+	c := New(b)
+	c.SetPC(0x0100)
+
+	// Set up IME and request VBlank (bit0) with IE enabled
+	c.IME = true
+	b.Write(0xFFFF, 0x01) // IE VBlank
+	b.Write(0xFF0F, 0x01) // IF VBlank
+
+	cycles := c.Step()
+	if cycles != 20 {
+		t.Fatalf("expected 20 cycles for interrupt service, got %d", cycles)
+	}
+	if c.PC != 0x0040 {
+		t.Fatalf("expected PC at 0x0040 vector, got %04X", c.PC)
+	}
+
+	// Ensure IME cleared after service
+	if c.IME {
+		t.Fatal("IME should be cleared after interrupt service")
+	}
+
+	// Test HALT waking up without IME when IF&IE != 0
+	c.halted = true
+	b.Write(0xFFFF, 0x02) // enable LCD STAT
+	b.Write(0xFF0F, 0x02) // request STAT
+	cyc := c.Step()
+	if cyc != 4 {
+		t.Fatalf("halt step without servicing should take 4 cycles, got %d", cyc)
+	}
+	if c.halted {
+		t.Fatal("HALT should wake (become unhalted) when IF&IE!=0 even with IME=0 (simplified HALT bug)")
+	}
+}
