@@ -106,10 +106,10 @@ func TestCPU_LD_16bit_and_LDH(t *testing.T) {
 	// LD HL,0xC000; LD (HL),0x5A; LD A,0x00; LD A,(0xFF00+0x00); LD (0xFF00+1),A
 	prog := []byte{
 		0x21, 0x00, 0xC0, // LD HL, C000
-		0x36, 0x5A,       // LD (HL), 5A
-		0x3E, 0x00,       // LD A, 00
-		0xF0, 0x00,       // LD A, (FF00+0)
-		0xE0, 0x01,       // LD (FF00+1), A
+		0x36, 0x5A, // LD (HL), 5A
+		0x3E, 0x00, // LD A, 00
+		0xF0, 0x00, // LD A, (FF00+0)
+		0xE0, 0x01, // LD (FF00+1), A
 	}
 	c := newCPUWithROM(prog)
 	// Preload FF00 with 0xA7 via bus
@@ -117,7 +117,11 @@ func TestCPU_LD_16bit_and_LDH(t *testing.T) {
 	c.Bus().Write(0xFF00, 0x30) // select none to keep 0x0F
 	c.Bus().Write(0xFF80, 0xA7) // HRAM base
 
-	c.Step(); c.Step(); c.Step(); c.Step(); c.Step()
+	c.Step()
+	c.Step()
+	c.Step()
+	c.Step()
+	c.Step()
 	if v := c.Bus().Read(0xC000); v != 0x5A {
 		t.Fatalf("WRAM C000 got %02x want 5A", v)
 	}
@@ -132,7 +136,9 @@ func TestCPU_CALL_RET(t *testing.T) {
 	rom[0x0000] = 0xCD
 	rom[0x0001] = 0x05
 	rom[0x0002] = 0x00
-	for i := 0x0003; i < 0x0005; i++ { rom[i] = 0x00 }
+	for i := 0x0003; i < 0x0005; i++ {
+		rom[i] = 0x00
+	}
 	rom[0x0005] = 0xC9 // RET
 	b := bus.New(rom)
 	c := New(b)
@@ -145,4 +151,3 @@ func TestCPU_CALL_RET(t *testing.T) {
 		t.Fatalf("RET did not return to 0003; PC=%04x cyc=%d", c.PC, retCycles)
 	}
 }
-
