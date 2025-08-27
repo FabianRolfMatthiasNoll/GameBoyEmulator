@@ -1,11 +1,11 @@
 package ui
 
 import (
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
 	"image/png"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -189,9 +189,17 @@ func (a *App) Update() error {
 			if inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
 				switch a.menuIdx {
 				case 0: // Save (slot 0)
-					if err := a.saveSlot(0); err == nil { a.toast("Saved slot 0") } else { a.toast("Save failed: "+err.Error()) }
+					if err := a.saveSlot(0); err == nil {
+						a.toast("Saved slot 0")
+					} else {
+						a.toast("Save failed: " + err.Error())
+					}
 				case 1: // Load (slot 0)
-					if err := a.loadSlot(0); err == nil { a.toast("Loaded slot 0") } else { a.toast("Load failed: "+err.Error()) }
+					if err := a.loadSlot(0); err == nil {
+						a.toast("Loaded slot 0")
+					} else {
+						a.toast("Load failed: " + err.Error())
+					}
 				case 2: // Switch ROM
 					a.romList = a.findROMs()
 					a.romSel = 0
@@ -691,18 +699,30 @@ func loadSettings(override Config) Config {
 		_ = json.Unmarshal(b, &cfg)
 	}
 	// override non-zero fields from param
-	if override.Title != "" { cfg.Title = override.Title }
-	if override.Scale != 0 { cfg.Scale = override.Scale }
-	if override.AudioBufferMs != 0 { cfg.AudioBufferMs = override.AudioBufferMs }
-	if override.ROMsDir != "" { cfg.ROMsDir = override.ROMsDir }
+	if override.Title != "" {
+		cfg.Title = override.Title
+	}
+	if override.Scale != 0 {
+		cfg.Scale = override.Scale
+	}
+	if override.AudioBufferMs != 0 {
+		cfg.AudioBufferMs = override.AudioBufferMs
+	}
+	if override.ROMsDir != "" {
+		cfg.ROMsDir = override.ROMsDir
+	}
 	cfg.AudioStereo = override.AudioStereo || cfg.AudioStereo
 	cfg.AudioAdaptive = override.AudioAdaptive || cfg.AudioAdaptive
-	if cfg.Title == "" && override.Title == "" { cfg.Title = "gbemu" }
+	if cfg.Title == "" && override.Title == "" {
+		cfg.Title = "gbemu"
+	}
 	return cfg
 }
 
 func (a *App) saveSettings() {
-	if a == nil { return }
+	if a == nil {
+		return
+	}
 	b, _ := json.MarshalIndent(a.cfg, "", "  ")
 	_ = os.WriteFile(settingsPath(), b, 0644)
 }
