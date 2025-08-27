@@ -1,6 +1,8 @@
 package cpu
 
 import (
+	"bytes"
+	"encoding/gob"
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/bus"
 )
 
@@ -19,6 +21,11 @@ type CPU struct {
 	halted bool
 	// EI enables IME after the following instruction
 	eiPending bool
+	// haltBug indicates HALT bug should duplicate the next fetched byte
+	haltBug bool
+	// haltDupActive indicates the next fetch should return haltDup and still increment PC
+	haltDupActive bool
+	haltDup       byte
 
 	bus *bus.Bus
 }
@@ -156,8 +163,21 @@ func (c *CPU) read8(addr uint16) byte     { return c.bus.Read(addr) }
 func (c *CPU) write8(addr uint16, v byte) { c.bus.Write(addr, v) }
 
 func (c *CPU) fetch8() byte {
+	if c.haltDupActive {
+		// Return duplicated byte and advance PC
+		b := c.haltDup
+		c.haltDupActive = false
+		c.PC++
+		return b
+	}
 	b := c.read8(c.PC)
 	c.PC++
+	if c.haltBug {
+		// Schedule duplication of this byte on the next fetch
+		c.haltDup = b
+		c.haltDupActive = true
+		c.haltBug = false
+	}
 	return b
 }
 
@@ -205,12 +225,13 @@ func (c *CPU) Step() (cycles int) {
 		if c.bus != nil && cycles > 0 {
 			c.bus.Tick(cycles)
 		}
-		// Apply EI delayed enable after completing this instruction
-		if c.eiPending {
-			c.IME = true
-			c.eiPending = false
-		}
 	}()
+
+	// Apply EI delayed enable from the previous instruction
+	if c.eiPending {
+		c.IME = true
+		c.eiPending = false
+	}
 
 	// Interrupt servicing helper
 	serviceInterrupt := func() int {
@@ -243,8 +264,10 @@ func (c *CPU) Step() (cycles int) {
 			if cyc := serviceInterrupt(); cyc != 0 {
 				return cyc
 			}
+			// Remain halted until an interrupt occurs
+			return 4
 		} else {
-			// wake on pending interrupt without servicing (HALT bug simplified)
+			// pending interrupt without IME -> remain running
 			ifReg := c.bus.Read(0xFF0F) & 0x1F
 			ie := c.bus.Read(0xFFFF)
 			if (ifReg & ie) != 0 {
@@ -264,6 +287,9 @@ func (c *CPU) Step() (cycles int) {
 
 	op := c.fetch8()
 	switch op {
+	case 0x10: // STOP (DMG: 2-byte instruction; second byte is padding). Simplify behavior.
+		_ = c.fetch8() // consume padding byte (usually 0x00)
+		return 4
 	case 0x00: // NOP
 		return 4
 
@@ -291,14 +317,15 @@ func (c *CPU) Step() (cycles int) {
 		return 8
 
 	// LD r,r' and LD (HL),r / LD r,(HL)
-	case 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x47,
-		0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4F,
-		0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x57,
-		0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5F,
-		0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x67,
-		0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6F,
-		0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x77,
-		0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7F:
+	// Include all opcodes 0x40..0x7F except 0x76 (HALT handled separately)
+	case 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+		0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F,
+		0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57,
+		0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F,
+		0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67,
+		0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F,
+		0x70, 0x71, 0x72, 0x73, 0x74, 0x75, /*0x76 HALT*/ 0x77,
+		0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F:
 		if op == 0x76 { // HALT handled elsewhere
 			c.halted = true
 			return 4
@@ -1108,9 +1135,12 @@ func (c *CPU) Step() (cycles int) {
 	case 0xF8: // LD HL,SP+r8
 		off := int8(c.fetch8())
 		res := uint16(int32(int16(c.SP)) + int32(off))
-		// Flags: Z=0,N=0,H,C set from lower byte carry
-		low := byte(c.SP & 0xFF)
-		_, _, _, h, cy := c.add8(low, byte(off))
+		// Flags: Z=0,N=0,H/C from (SP ^ res ^ off) trick on low byte/byte boundary
+		x := uint32(c.SP)
+		y := uint32(uint16(int16(off)))
+		r := uint32(res)
+		h := ((x ^ y ^ r) & 0x10) != 0
+		cy := ((x ^ y ^ r) & 0x100) != 0
 		c.setHL(res)
 		c.setZNHC(false, false, h, cy)
 		return 12
@@ -1119,9 +1149,12 @@ func (c *CPU) Step() (cycles int) {
 		return 8
 	case 0xE8: // ADD SP,r8
 		off := int8(c.fetch8())
-		low := byte(c.SP & 0xFF)
-		_, _, _, h, cy := c.add8(low, byte(off))
 		res := uint16(int32(int16(c.SP)) + int32(off))
+		x := uint32(c.SP)
+		y := uint32(uint16(int16(off)))
+		r := uint32(res)
+		h := ((x ^ y ^ r) & 0x10) != 0
+		cy := ((x ^ y ^ r) & 0x100) != 0
 		c.SP = res
 		c.setZNHC(false, false, h, cy)
 		return 16
@@ -1132,6 +1165,7 @@ func (c *CPU) Step() (cycles int) {
 		c.eiPending = false
 		return 4
 	case 0xFB: // EI (enable after following instruction)
+		// Set a pending flag; IME will be enabled at the start of the NEXT Step()
 		c.eiPending = true
 		return 4
 
@@ -1184,11 +1218,11 @@ func (c *CPU) Step() (cycles int) {
 			}
 		}
 		cycles := 8
-		if reg == 6 {
-			cycles = 16
-		}
 		switch opg {
 		case 0: // rotate/shift/swap
+			if reg == 6 {
+				cycles = 16
+			}
 			v := get(reg)
 			var cflag byte
 			switch y {
@@ -1234,6 +1268,9 @@ func (c *CPU) Step() (cycles int) {
 			}
 			set(reg, v)
 		case 1: // BIT y, r
+			if reg == 6 {
+				cycles = 12
+			}
 			v := get(reg)
 			bit := (v >> y) & 1
 			z := bit == 0
@@ -1243,10 +1280,16 @@ func (c *CPU) Step() (cycles int) {
 				c.F |= flagZ
 			}
 		case 2: // RES y, r
+			if reg == 6 {
+				cycles = 16
+			}
 			v := get(reg)
 			v &^= (1 << y)
 			set(reg, v)
 		case 3: // SET y, r
+			if reg == 6 {
+				cycles = 16
+			}
 			v := get(reg)
 			v |= (1 << y)
 			set(reg, v)
@@ -1280,13 +1323,70 @@ func (c *CPU) Step() (cycles int) {
 		return 12
 
 	case 0x76: // HALT
-		c.halted = true
-		return 4
+			// If interrupts are disabled but a request is pending and enabled, trigger HALT bug
+			if !c.IME {
+				ifReg := c.bus.Read(0xFF0F) & 0x1F
+				ie := c.bus.Read(0xFFFF)
+				if (ifReg & ie) != 0 {
+					c.haltBug = true
+					c.halted = false
+					return 4
+				}
+			}
+			c.halted = true
+			return 4
 
 	default:
 		// Unimplemented opcodes: act as NOP for now (to keep tests simple)
 		return 4
 	}
+}
+
+// --- Save/Load state ---
+// cpuState captures all CPU registers and internal flags needed to resume execution.
+type cpuState struct {
+	A, F       byte
+	B, C       byte
+	D, E       byte
+	H, L       byte
+	SP, PC     uint16
+	IME        bool
+	Halted     bool
+	EiPending  bool
+	HaltBug    bool
+	HaltDupAct bool
+	HaltDup    byte
+}
+
+// SaveState serializes the CPU state to a byte slice.
+func (c *CPU) SaveState() []byte {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	s := cpuState{
+		A: c.A, F: c.F, B: c.B, C: c.C, D: c.D, E: c.E, H: c.H, L: c.L,
+		SP: c.SP, PC: c.PC, IME: c.IME,
+		Halted: c.halted, EiPending: c.eiPending, HaltBug: c.haltBug,
+		HaltDupAct: c.haltDupActive, HaltDup: c.haltDup,
+	}
+	_ = enc.Encode(s)
+	return buf.Bytes()
+}
+
+// LoadState restores the CPU state from a byte slice.
+func (c *CPU) LoadState(data []byte) {
+	var s cpuState
+	dec := gob.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&s); err != nil {
+		return
+	}
+	c.A, c.F, c.B, c.C, c.D, c.E, c.H, c.L = s.A, s.F, s.B, s.C, s.D, s.E, s.H, s.L
+	c.SP, c.PC = s.SP, s.PC
+	c.IME = s.IME
+	c.halted = s.Halted
+	c.eiPending = s.EiPending
+	c.haltBug = s.HaltBug
+	c.haltDupActive = s.HaltDupAct
+	c.haltDup = s.HaltDup
 }
 
 // LD r,r' table and LD via (HL) handling

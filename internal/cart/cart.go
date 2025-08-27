@@ -7,6 +7,9 @@ type Cartridge interface {
 	Read(addr uint16) byte
 	// Write handles MBC control writes (0x0000–0x7FFF) and external RAM writes (0xA000–0xBFFF).
 	Write(addr uint16, value byte)
+	// SaveState/LoadState serialize internal banking registers and external RAM for save states.
+	SaveState() []byte
+	LoadState(data []byte)
 }
 
 // BatteryBacked is an optional interface for cartridges with external RAM to be persisted.

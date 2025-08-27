@@ -1,5 +1,10 @@
 package ppu
 
+import (
+	"bytes"
+	"encoding/gob"
+)
+
 // InterruptRequester is a callback signature to request IF bits (0:VBlank, 1:STAT, etc.).
 type InterruptRequester func(bit int)
 
@@ -304,3 +309,49 @@ func (p *PPU) SCY() byte  { return p.scy }
 func (p *PPU) SCX() byte  { return p.scx }
 func (p *PPU) WY() byte   { return p.wy }
 func (p *PPU) WX() byte   { return p.wx }
+
+// --- Save/Load state ---
+type ppuState struct {
+	VRAM [0x2000]byte
+	OAM  [0xA0]byte
+	LCDC byte
+	STAT byte
+	SCY  byte
+	SCX  byte
+	LY   byte
+	LYC  byte
+	BGP  byte
+	OBP0 byte
+	OBP1 byte
+	WY   byte
+	WX   byte
+	DOT  int
+	LineRegs [154]LineRegs
+	WinLine byte
+}
+
+func (p *PPU) SaveState() []byte {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	s := ppuState{
+		VRAM: p.vram, OAM: p.oam,
+		LCDC: p.lcdc, STAT: p.stat, SCY: p.scy, SCX: p.scx, LY: p.ly, LYC: p.lyc,
+		BGP: p.bgp, OBP0: p.obp0, OBP1: p.obp1, WY: p.wy, WX: p.wx,
+		DOT: p.dot, LineRegs: p.lineRegs, WinLine: p.winLineCounter,
+	}
+	_ = enc.Encode(s)
+	return buf.Bytes()
+}
+
+func (p *PPU) LoadState(data []byte) {
+	var s ppuState
+	dec := gob.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&s); err != nil { return }
+	p.vram = s.VRAM
+	p.oam = s.OAM
+	p.lcdc, p.stat, p.scy, p.scx, p.ly, p.lyc = s.LCDC, s.STAT, s.SCY, s.SCX, s.LY, s.LYC
+	p.bgp, p.obp0, p.obp1, p.wy, p.wx = s.BGP, s.OBP0, s.OBP1, s.WY, s.WX
+	p.dot = s.DOT
+	p.lineRegs = s.LineRegs
+	p.winLineCounter = s.WinLine
+}

@@ -26,3 +26,6 @@ func (c *ROMOnly) Read(addr uint16) byte {
 func (c *ROMOnly) Write(addr uint16, value byte) {
 	// ROM-only: writes are ignored (including 0x0000–0x7FFF and 0xA000–0xBFFF)
 }
+
+func (c *ROMOnly) SaveState() []byte { return nil }
+func (c *ROMOnly) LoadState(data []byte) {}

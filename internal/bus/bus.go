@@ -1,7 +1,11 @@
 package bus
 
 import (
+	"bytes"
+	"encoding/gob"
+	"fmt"
 	"io"
+	"os"
 
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/cart"
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/ppu"
@@ -35,6 +39,10 @@ type Bus struct {
 	tma  byte // FF06
 	tac  byte // FF07 (lower 3 bits used)
 
+	// Timer overflow handling: when TIMA overflows, it goes to 00 then reloads from TMA after a short delay
+	// during which writes to TIMA cancel the reload.
+	timaReloadDelay int // cycles remaining until reload from TMA; 0 means no pending reload
+
 	// Serial
 	sb byte      // FF01 data
 	sc byte      // FF02 control (bit7 start, bit0 clock source; we do immediate external)
@@ -50,6 +58,13 @@ type Bus struct {
 	dmaActive bool
 	dmaSrc    uint16
 	dmaIndex  int
+
+	// Boot ROM support
+	bootROM     []byte
+	bootEnabled bool
+
+	// debug
+	debugTimer bool
 }
 
 // New constructs a Bus with a ROM-only cartridge for convenience.
@@ -62,6 +77,9 @@ func NewWithCartridge(c cart.Cartridge) *Bus {
 	b := &Bus{cart: c}
 	// hook PPU to request IF bits through bus
 	b.ppu = ppu.New(func(bit int) { b.ifReg |= 1 << bit })
+	if os.Getenv("GB_DEBUG_TIMER") != "" {
+		b.debugTimer = true
+	}
 	return b
 }
 
@@ -75,6 +93,10 @@ func (b *Bus) Read(addr uint16) byte {
 	switch {
 	// Cartridge ROM and External RAM (banked) are handled by the cartridge
 	case addr < 0x8000:
+		// When boot ROM is enabled, it overlays 0x0000-0x00FF
+		if b.bootEnabled && addr < 0x0100 && len(b.bootROM) >= 0x100 {
+			return b.bootROM[addr]
+		}
 		return b.cart.Read(addr)
 	// VRAM (via PPU)
 	case addr >= 0x8000 && addr <= 0x9FFF:
@@ -159,6 +181,9 @@ func (b *Bus) Read(addr uint16) byte {
 		return b.ppu.CPURead(addr)
 	case addr == 0xFF46:
 		return b.dma
+	// Boot ROM disable register (read returns 0xFF on DMG; keep simple)
+	case addr == 0xFF50:
+		return 0xFF
 	// IO: IF at 0xFF0F, other IO not implemented (return 0xFF)
 	case addr == 0xFF0F:
 		return 0xE0 | (b.ifReg & 0x1F)
@@ -223,12 +248,25 @@ func (b *Bus) Write(addr uint16, value byte) {
 		if oldInput && !b.timerInput() {
 			b.incrementTIMA()
 		}
+			if b.debugTimer {
+				fmt.Printf("[TMR] DIV write -> reset (div=0000) tima=%02X tma=%02X tac=%02X reload=%d\n", b.tima, b.tma, b.tac, b.timaReloadDelay)
+			}
 		return
 	case addr == 0xFF05:
+		// Writing TIMA during a pending reload cancels the reload and sets TIMA to the written value.
 		b.tima = value
+		if b.timaReloadDelay > 0 {
+			b.timaReloadDelay = 0
+		}
+			if b.debugTimer {
+				fmt.Printf("[TMR] TIMA write %02X tma=%02X tac=%02X reload=%d\n", value, b.tma, b.tac, b.timaReloadDelay)
+			}
 		return
 	case addr == 0xFF06:
 		b.tma = value
+			if b.debugTimer {
+				fmt.Printf("[TMR] TMA write %02X (tima=%02X tac=%02X reload=%d)\n", value, b.tima, b.tac, b.timaReloadDelay)
+			}
 		return
 	case addr == 0xFF07:
 		// Changing TAC can cause a falling edge on the timer input; handle increment accordingly.
@@ -237,6 +275,9 @@ func (b *Bus) Write(addr uint16, value byte) {
 		if oldInput && !b.timerInput() {
 			b.incrementTIMA()
 		}
+			if b.debugTimer {
+				fmt.Printf("[TMR] TAC write %02X (input %v->%v) tima=%02X tma=%02X reload=%d\n", b.tac, oldInput, b.timerInput(), b.tima, b.tma, b.timaReloadDelay)
+			}
 		return
 	// Serial
 	case addr == 0xFF01:
@@ -268,6 +309,12 @@ func (b *Bus) Write(addr uint16, value byte) {
 		b.dmaActive = true
 		b.dmaSrc = uint16(value) << 8
 		b.dmaIndex = 0
+		return
+	case addr == 0xFF50:
+		// Any non-zero write disables the boot ROM overlay
+		if value != 0x00 {
+			b.bootEnabled = false
+		}
 		return
 	// IO: IF at 0xFF0F
 	case addr == 0xFF0F:
@@ -303,6 +350,17 @@ func (b *Bus) SetJoypadState(mask byte) {
 // SetSerialWriter sets a sink that receives bytes written via the serial port.
 func (b *Bus) SetSerialWriter(w io.Writer) { b.sw = w }
 
+// SetBootROM loads a DMG boot ROM to be mapped at 0x0000-0x00FF until disabled via 0xFF50 write.
+func (b *Bus) SetBootROM(data []byte) {
+	b.bootROM = nil
+	b.bootEnabled = false
+	if len(data) >= 0x100 {
+		b.bootROM = make([]byte, 0x100)
+		copy(b.bootROM, data[:0x100])
+		b.bootEnabled = true
+	}
+}
+
 // Tick advances timers by the given number of CPU cycles.
 // True-to-hardware: TIMA increments on falling edge of selected divider bit
 // determined by TAC (00:bit9, 01:bit3, 10:bit5, 11:bit7), gated by TAC enable.
@@ -315,7 +373,20 @@ func (b *Bus) Tick(cycles int) {
 		b.divInternal++
 		b.div = byte(b.divInternal >> 8)
 		newInput := b.timerInput()
-		if oldInput && !newInput {
+		falling := oldInput && !newInput
+
+		// First, handle delayed TIMA reload if pending; on expiry, reload then allow an increment in this cycle
+		if b.timaReloadDelay > 0 {
+			b.timaReloadDelay--
+			if b.timaReloadDelay == 0 {
+				// On expiry, load TMA and request interrupt before processing any increment for this cycle
+				b.tima = b.tma
+				b.ifReg |= 1 << 2
+			}
+		}
+
+		// Apply falling-edge increment after potential reload so edge on reload cycle increments reloaded value
+		if falling {
 			b.incrementTIMA()
 		}
 		// Tick PPU via module
@@ -357,12 +428,18 @@ func (b *Bus) timerInput() bool {
 }
 
 func (b *Bus) incrementTIMA() {
-	if b.tima == 0xFF {
-		b.tima = b.tma
-		b.ifReg |= 1 << 2 // request Timer interrupt
-	} else {
-		b.tima++
+	// During a pending reload delay, further increments are ignored (until reload or cancellation)
+	if b.timaReloadDelay > 0 {
+		return
 	}
+	if b.tima == 0xFF {
+		// Overflow: set to 0x00 now, schedule delayed reload from TMA and IF request
+		b.tima = 0x00
+	// Reload occurs 4 cycles after the overflow, handled in Tick before edge increments
+	b.timaReloadDelay = 4
+		return
+	}
+	b.tima++
 }
 
 // PPU step: very simplified mode scheduling and LY counter
@@ -407,4 +484,84 @@ func (b *Bus) updateJoypadIRQ() {
 		b.ifReg |= 1 << 4
 	}
 	b.joypLower4 = newLower
+}
+
+// --- Save/Load state ---
+type busState struct {
+	WRAM      [0x2000]byte
+	HRAM      [0x7F]byte
+	IE, IF    byte
+	JoypSel   byte
+	Joypad    byte
+	JoypL4    byte
+	DIV       byte
+	TIMA      byte
+	TMA       byte
+	TAC       byte
+	TIMARelay int
+	SB, SC    byte
+	DivInt    uint16
+	DMA       byte
+	DMAActive bool
+	DMASrc    uint16
+	DMAIdx    int
+	BootEn    bool
+	// PPU and cartridge will handle their own state via their interfaces
+}
+
+func (b *Bus) SaveState() []byte {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	s := busState{
+		WRAM: b.wram, HRAM: b.hram,
+		IE: b.ie, IF: b.ifReg,
+		JoypSel: b.joypSelect, Joypad: b.joypad, JoypL4: b.joypLower4,
+		DIV: b.div, TIMA: b.tima, TMA: b.tma, TAC: b.tac, TIMARelay: b.timaReloadDelay,
+		SB: b.sb, SC: b.sc, DivInt: b.divInternal,
+	DMA: b.dma, DMAActive: b.dmaActive, DMASrc: b.dmaSrc, DMAIdx: b.dmaIndex,
+	BootEn: b.bootEnabled,
+	}
+	_ = enc.Encode(s)
+	// Append PPU and Cart states after a simple header so we can restore later
+	// PPU state
+	if b.ppu != nil {
+		ps := b.ppu.SaveState()
+		_ = enc.Encode(ps)
+	} else {
+		_ = enc.Encode([]byte(nil))
+	}
+	// Cart state
+	if bb, ok := b.cart.(interface{ SaveState() []byte }); ok {
+		cs := bb.SaveState()
+		_ = enc.Encode(cs)
+	} else {
+		_ = enc.Encode([]byte(nil))
+	}
+	return buf.Bytes()
+}
+
+func (b *Bus) LoadState(data []byte) {
+	dec := gob.NewDecoder(bytes.NewReader(data))
+	var s busState
+	if err := dec.Decode(&s); err != nil { return }
+	b.wram = s.WRAM
+	b.hram = s.HRAM
+	b.ie, b.ifReg = s.IE, s.IF
+	b.joypSelect, b.joypad, b.joypLower4 = s.JoypSel, s.Joypad, s.JoypL4
+	b.div, b.tima, b.tma, b.tac, b.timaReloadDelay = s.DIV, s.TIMA, s.TMA, s.TAC, s.TIMARelay
+	b.sb, b.sc, b.divInternal = s.SB, s.SC, s.DivInt
+	b.dma, b.dmaActive, b.dmaSrc, b.dmaIndex = s.DMA, s.DMAActive, s.DMASrc, s.DMAIdx
+	b.bootEnabled = s.BootEn
+	// PPU
+	var ps []byte
+	if err := dec.Decode(&ps); err == nil && b.ppu != nil {
+		b.ppu.LoadState(ps)
+	}
+	// Cart
+	var cs []byte
+	if err := dec.Decode(&cs); err == nil {
+		if bb, ok := b.cart.(interface{ LoadState([]byte) }); ok {
+			bb.LoadState(cs)
+		}
+	}
 }

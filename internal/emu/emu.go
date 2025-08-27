@@ -1,6 +1,9 @@
 package emu
 
 import (
+	"bytes"
+	"encoding/gob"
+	"os"
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/bus"
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/cart"
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/cpu"
@@ -20,6 +23,7 @@ type Machine struct {
 	bus     *bus.Bus
 	cpu     *cpu.CPU
 	romPath string
+	bootROM []byte
 }
 
 func New(cfg Config) *Machine {
@@ -39,13 +43,96 @@ func (m *Machine) LoadCartridge(rom []byte, boot []byte) error {
 	_ = romHeader
 	// Wire bus+cpu. For now, ROM-only cartridge via bus.New.
 	b := bus.New(rom)
+	// If a boot ROM is provided, install it and start from 0x0000 with boot enabled.
+	if len(boot) >= 0x100 {
+		b.SetBootROM(boot)
+	}
 	c := cpu.New(b)
-	// Run without boot ROM for now (typical DMG post-boot state)
-	c.ResetNoBoot()
-	c.SetPC(0x0100)
+	if len(boot) >= 0x100 {
+		// Boot ROM path: start at 0x0000; do not force post-boot IO
+		c.SP = 0xFFFE
+		c.PC = 0x0000
+		c.IME = false
+	} else {
+		// No boot ROM: initialize to DMG post-boot state
+		c.ResetNoBoot()
+		c.SetPC(0x0100)
+	}
 	m.bus = b
 	m.cpu = c
+	m.bootROM = nil
+	if len(boot) >= 0x100 {
+		m.bootROM = make([]byte, 0x100)
+		copy(m.bootROM, boot[:0x100])
+	}
+	// Apply DMG post-boot IO defaults only when no boot ROM is used
+	if len(boot) < 0x100 {
+		m.applyDMGPostBootIO()
+	}
 	return nil
+}
+
+// LoadROMFromFile replaces the current cartridge with a ROM from disk, preserving boot ROM setting.
+func (m *Machine) LoadROMFromFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil { return err }
+	var boot []byte
+	if len(m.bootROM) >= 0x100 {
+		boot = m.bootROM
+	}
+	if err := m.LoadCartridge(data, boot); err != nil { return err }
+	m.romPath = path
+	return nil
+}
+
+// ResetPostBoot resets CPU and IO to DMG post-boot state (no boot ROM), keeping the loaded cartridge.
+func (m *Machine) ResetPostBoot() {
+	if m.cpu == nil || m.bus == nil {
+		return
+	}
+	m.cpu.ResetNoBoot()
+	m.cpu.SetPC(0x0100)
+	m.applyDMGPostBootIO()
+}
+
+// ResetWithBoot re-enables the boot ROM (if present) and restarts execution from 0x0000.
+func (m *Machine) ResetWithBoot() {
+	if m.cpu == nil || m.bus == nil || len(m.bootROM) < 0x100 {
+		// Fallback to post-boot reset if no boot ROM
+		m.ResetPostBoot()
+		return
+	}
+	m.bus.SetBootROM(m.bootROM)
+	m.cpu.SP = 0xFFFE
+	m.cpu.PC = 0x0000
+	m.cpu.IME = false
+}
+
+// applyDMGPostBootIO sets a minimal set of IO registers to DMG post-boot defaults,
+// so ROMs can start from PC=0x0100 without a boot ROM and still have LCD enabled.
+func (m *Machine) applyDMGPostBootIO() {
+	if m == nil || m.bus == nil {
+		return
+	}
+	b := m.bus
+	// Joypad: no group selected, high bits set
+	b.Write(0xFF00, 0xCF)
+	// Timers
+	b.Write(0xFF05, 0x00) // TIMA
+	b.Write(0xFF06, 0x00) // TMA
+	b.Write(0xFF07, 0x00) // TAC (disabled)
+	// PPU regs (enable LCD, BG/window; default palettes)
+	b.Write(0xFF40, 0x91) // LCDC: LCD on, BG on, tile data 8000, BG map 9800, sprites on 8x8
+	b.Write(0xFF42, 0x00) // SCY
+	b.Write(0xFF43, 0x00) // SCX
+	b.Write(0xFF45, 0x00) // LYC
+	b.Write(0xFF47, 0xFC) // BGP
+	b.Write(0xFF48, 0xFF) // OBP0
+	b.Write(0xFF49, 0xFF) // OBP1
+	b.Write(0xFF4A, 0x00) // WY
+	b.Write(0xFF4B, 0x00) // WX
+	// IE: none enabled by default
+	b.Write(0xFFFF, 0x00)
 }
 
 // SaveBattery tries to persist external cartridge RAM to a provided sink via the BatteryBacked interface.
@@ -92,6 +179,50 @@ func (m *Machine) StepFrame() {
 }
 
 func (m *Machine) Framebuffer() []byte { return m.fb }
+
+// SetSerialWriter connects an io.Writer to receive bytes written to the serial port (FF01/FF02).
+// Useful for running test ROMs that report via serial.
+func (m *Machine) SetSerialWriter(w interface{ Write([]byte) (int, error) }) {
+	if m != nil && m.bus != nil {
+		m.bus.SetSerialWriter(w)
+	}
+}
+
+// --- Save/Load state ---
+type machineState struct {
+	Bus []byte
+	CPU []byte
+}
+
+func (m *Machine) SaveState() []byte {
+	if m == nil || m.bus == nil || m.cpu == nil { return nil }
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	_ = enc.Encode(machineState{ Bus: m.bus.SaveState(), CPU: m.cpu.SaveState() })
+	return buf.Bytes()
+}
+
+func (m *Machine) LoadState(data []byte) error {
+	if m == nil || m.bus == nil || m.cpu == nil { return nil }
+	var s machineState
+	dec := gob.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&s); err != nil { return err }
+	m.bus.LoadState(s.Bus)
+	m.cpu.LoadState(s.CPU)
+	return nil
+}
+
+func (m *Machine) SaveStateToFile(path string) error {
+	data := m.SaveState()
+	if len(data) == 0 { return nil }
+	return os.WriteFile(path, data, 0644)
+}
+
+func (m *Machine) LoadStateFromFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil { return err }
+	return m.LoadState(data)
+}
 func (m *Machine) SetButtons(b Buttons) {
 	if m.bus == nil {
 		return
