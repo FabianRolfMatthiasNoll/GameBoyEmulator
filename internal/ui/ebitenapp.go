@@ -800,15 +800,16 @@ func (a *App) findROMs() []string {
 			}
 		}
 	}
-	// Resolve ROMsDir relative to the executable directory
+	// Resolve ROMsDir: if absolute, use it; if relative, try both exe-relative and CWD-relative
 	exe, _ := os.Executable()
 	exedir := filepath.Dir(exe)
 	roms := a.cfg.ROMsDir
-	if !filepath.IsAbs(roms) {
-		roms = filepath.Join(exedir, roms)
+	if filepath.IsAbs(roms) {
+		addFrom(roms)
+	} else {
+		addFrom(filepath.Join(exedir, roms))
+		addFrom(roms) // relative to current working directory
 	}
-	addFrom(roms)
-	addFrom(".")
 	sort.Strings(files)
 	// de-dup
 	uniq := files[:0]

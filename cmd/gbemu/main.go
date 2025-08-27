@@ -8,6 +8,7 @@ import (
 	"image/png"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -136,6 +137,15 @@ func main() {
 	if len(rom) > 0 {
 		if err := m.LoadCartridge(rom, boot); err != nil {
 			log.Fatalf("load cart: %v", err)
+		}
+		// Mark ROM path on the machine so UI knows a game is loaded
+		if f.ROMPath != "" {
+			// prefer absolute path for state/save placement consistency
+			if abs, err := filepath.Abs(f.ROMPath); err == nil {
+				_ = m.LoadROMFromFile(abs) // reload through file path to set romPath
+			} else {
+				_ = m.LoadROMFromFile(f.ROMPath)
+			}
 		}
 	}
 
