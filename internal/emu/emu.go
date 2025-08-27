@@ -138,6 +138,11 @@ func (m *Machine) applyDMGPostBootIO() {
 	b.Write(0xFF4B, 0x00) // WX
 	// IE: none enabled by default
 	b.Write(0xFFFF, 0x00)
+	// APU defaults (power on + route all to both, medium volume)
+	b.Write(0xFF26, 0x80) // NR52 power
+	b.Write(0xFF24, 0x77) // NR50: Vin off, L=7, R=7
+	b.Write(0xFF25, 0xFF) // NR51: route all ch to both
+	// Leave channels off until games configure them
 }
 
 // SaveBattery tries to persist external cartridge RAM to a provided sink via the BatteryBacked interface.
@@ -191,6 +196,14 @@ func (m *Machine) SetSerialWriter(w interface{ Write([]byte) (int, error) }) {
 	if m != nil && m.bus != nil {
 		m.bus.SetSerialWriter(w)
 	}
+}
+
+// APUPullSamples returns up to max mono int16 samples from the APU ring buffer.
+func (m *Machine) APUPullSamples(max int) []int16 {
+	if m == nil || m.bus == nil || m.bus.APU() == nil {
+		return nil
+	}
+	return m.bus.APU().PullSamples(max)
 }
 
 // --- Save/Load state ---

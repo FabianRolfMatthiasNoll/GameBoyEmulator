@@ -15,6 +15,8 @@ import (
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
+	"github.com/hajimehoshi/ebiten/v2/audio"
+	"encoding/binary"
 )
 
 type App struct {
@@ -23,6 +25,10 @@ type App struct {
 	tex    *ebiten.Image
 	paused bool
 	fast   bool
+
+	// audio
+	audioCtx    *audio.Context
+	audioPlayer *audio.Player
 
 	// overlay/menu
 	showMenu bool
@@ -48,7 +54,15 @@ func NewApp(cfg Config, m *emu.Machine) *App {
 	}
 	ebiten.SetWindowTitle(cfg.Title)
 	ebiten.SetWindowSize(160*cfg.Scale, 144*cfg.Scale)
-	return &App{cfg: cfg, m: m}
+	a := &App{cfg: cfg, m: m}
+	// Init audio at 48kHz to match APU
+	a.audioCtx = audio.NewContext(48000)
+	// Create a streaming player that pulls from the emulator APU
+	if p, err := a.audioCtx.NewPlayer(&apuStream{m: m}); err == nil {
+		a.audioPlayer = p
+		a.audioPlayer.Play()
+	}
+	return a
 }
 
 func (a *App) Run() error { return ebiten.RunGame(a) }
@@ -260,7 +274,32 @@ func (a *App) Update() error {
 			}
 		}
 	}
+
 	return nil
+}
+
+// apuStream implements io.Reader by pulling PCM samples from the emulator APU and
+// converting them to 16-bit little-endian stereo frames.
+type apuStream struct { m *emu.Machine }
+
+func (s *apuStream) Read(p []byte) (int, error) {
+	if len(p) == 0 || s == nil || s.m == nil { return 0, nil }
+	// Each sample is 4 bytes (stereo int16). Fill the entire buffer.
+	want := len(p) / 4
+	samples := s.m.APUPullSamples(want)
+	// Convert and copy
+	i := 0
+	for _, v := range samples {
+		binary.LittleEndian.PutUint16(p[i:], uint16(v))
+		binary.LittleEndian.PutUint16(p[i+2:], uint16(v))
+		i += 4
+	}
+	// Fill remaining with silence
+	for i < len(p) {
+		p[i+0] = 0; p[i+1] = 0; p[i+2] = 0; p[i+3] = 0
+		i += 4
+	}
+	return len(p), nil
 }
 
 func (a *App) Draw(screen *ebiten.Image) {

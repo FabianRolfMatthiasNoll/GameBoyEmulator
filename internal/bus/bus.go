@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/cart"
+	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/apu"
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/ppu"
 )
 
@@ -24,6 +25,9 @@ type Bus struct {
 
 	// PPU encapsulates VRAM/OAM and LCDC/STAT timing
 	ppu *ppu.PPU
+
+	// APU for audio
+	apu *apu.APU
 
 	// Interrupt registers
 	ie    byte // IE at 0xFFFF
@@ -77,6 +81,8 @@ func NewWithCartridge(c cart.Cartridge) *Bus {
 	b := &Bus{cart: c}
 	// hook PPU to request IF bits through bus
 	b.ppu = ppu.New(func(bit int) { b.ifReg |= 1 << bit })
+	// APU with default sample rate; UI can pull samples via Machine later
+	b.apu = apu.New(48000)
 	if os.Getenv("GB_DEBUG_TIMER") != "" {
 		b.debugTimer = true
 	}
@@ -88,6 +94,9 @@ func (b *Bus) PPU() *ppu.PPU { return b.ppu }
 
 // Cart returns the underlying cartridge for optional battery operations (read-only interface exposure).
 func (b *Bus) Cart() cart.Cartridge { return b.cart }
+
+// APU returns the audio processing unit for pulling audio samples.
+func (b *Bus) APU() *apu.APU { return b.apu }
 
 func (b *Bus) Read(addr uint16) byte {
 	switch {
@@ -179,6 +188,11 @@ func (b *Bus) Read(addr uint16) byte {
 		addr == 0xFF47, addr == 0xFF48, addr == 0xFF49,
 		addr == 0xFF4A, addr == 0xFF4B:
 		return b.ppu.CPURead(addr)
+	// APU registers (subset): NR21..NR24, NR50..NR52
+	case addr >= 0xFF16 && addr <= 0xFF19,
+		addr == 0xFF24, addr == 0xFF25, addr == 0xFF26:
+		if b.apu != nil { return b.apu.CPURead(addr) }
+		return 0xFF
 	case addr == 0xFF46:
 		return b.dma
 	// Boot ROM disable register (read returns 0xFF on DMG; keep simple)
@@ -303,6 +317,11 @@ func (b *Bus) Write(addr uint16, value byte) {
 		addr == 0xFF4A, addr == 0xFF4B:
 		b.ppu.CPUWrite(addr, value)
 		return
+	// APU registers
+	case addr >= 0xFF16 && addr <= 0xFF19,
+		addr == 0xFF24, addr == 0xFF25, addr == 0xFF26:
+		if b.apu != nil { b.apu.CPUWrite(addr, value) }
+		return
 	case addr == 0xFF46:
 		// OAM DMA: initiate 160-byte transfer from value*0x100 to FE00, 1 byte per cycle
 		b.dma = value
@@ -392,6 +411,10 @@ func (b *Bus) Tick(cycles int) {
 		// Tick PPU via module
 		if b.ppu != nil {
 			b.ppu.Tick(1)
+		}
+		// Tick APU via module
+		if b.apu != nil {
+			b.apu.Tick(1)
 		}
 
 		// Step OAM DMA (1 byte per cycle) if active
@@ -506,6 +529,7 @@ type busState struct {
 	DMASrc    uint16
 	DMAIdx    int
 	BootEn    bool
+	APU       []byte
 	// PPU and cartridge will handle their own state via their interfaces
 }
 
@@ -527,6 +551,13 @@ func (b *Bus) SaveState() []byte {
 	if b.ppu != nil {
 		ps := b.ppu.SaveState()
 		_ = enc.Encode(ps)
+	} else {
+		_ = enc.Encode([]byte(nil))
+	}
+	// APU state
+	if b.apu != nil {
+		as := b.apu.SaveState()
+		_ = enc.Encode(as)
 	} else {
 		_ = enc.Encode([]byte(nil))
 	}
@@ -558,6 +589,11 @@ func (b *Bus) LoadState(data []byte) {
 	var ps []byte
 	if err := dec.Decode(&ps); err == nil && b.ppu != nil {
 		b.ppu.LoadState(ps)
+	}
+	// APU
+	var as []byte
+	if err := dec.Decode(&as); err == nil && b.apu != nil {
+		b.apu.LoadState(as)
 	}
 	// Cart
 	var cs []byte
