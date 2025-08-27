@@ -13,3 +13,6 @@ testroms/*.gbc
 
 testroms/**/*.gb
 testroms/**/*.gbc
+
+*.savestate
+*.png

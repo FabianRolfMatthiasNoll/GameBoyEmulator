@@ -8,7 +8,7 @@ import (
 // CPU frequency in Hz (DMG)
 const cpuHz = 4194304
 
-// APU is a minimal DMG audio unit with Channel 2 implemented (square without sweep).
+// APU is a DMG audio unit with channels 1, 2, 3, 4 implemented.
 // It generates mono 16-bit samples into an internal ring buffer at the given sample rate.
 type APU struct {
 	enabled bool
@@ -37,6 +37,10 @@ type APU struct {
 	ch1 chSquare
 	// Channel 2 (NR21..NR24)
 	ch2 chSquare
+	// Channel 3 (NR30..NR34) - wave
+	ch3 chWave
+	// Channel 4 (NR41..NR44) - noise
+	ch4 chNoise
 }
 
 type chSquare struct {
@@ -60,6 +64,35 @@ type chSquare struct {
 	sweepTmr    byte
 	sweepEn     bool
 	sweepShadow uint16
+}
+
+type chWave struct {
+	enabled bool
+	dacEn   bool
+	length  int // 0..255
+	lenEn   bool
+	volCode byte // 0..3 (0 mute, 1:100%, 2:50%, 3:25%)
+	freq    uint16
+	timer   int
+	pos     int      // 0..31
+	ram     [16]byte // FF30..FF3F (32 samples, 4-bit each)
+}
+
+type chNoise struct {
+	enabled bool
+	length  int
+	lenEn   bool
+	vol     byte
+	envDir  int8
+	envPer  byte
+	curVol  byte
+	envTmr  byte
+	// NR43
+	shift  byte // 0..15 shift clock frequency
+	width7 bool // true for 7-bit LFSR; false for 15-bit
+	divSel byte // 0..7 dividing ratio code
+	timer  int
+	lfsr   uint16 // 15-bit LFSR; bit0 is output
 }
 
 var dutyTable = [4][8]byte{
@@ -119,6 +152,39 @@ func (a *APU) CPURead(addr uint16) byte {
 		return byte(a.ch2.freq & 0xFF)
 	case 0xFF19: // NR24
 		return (boolToByte(a.ch2.lenEn) << 6) | byte((a.ch2.freq>>8)&7)
+	case 0xFF1A: // NR30 (CH3 DAC)
+		if a.ch3.dacEn {
+			return 0x80
+		} else {
+			return 0x00
+		}
+	case 0xFF1B: // NR31 length (CH3)
+		return byte(0xFF - (a.ch3.length & 0xFF))
+	case 0xFF1C: // NR32 volume (CH3)
+		return (a.ch3.volCode << 5) | 0x9F
+	case 0xFF1D: // NR33 freq lo (CH3)
+		return byte(a.ch3.freq & 0xFF)
+	case 0xFF1E: // NR34 (CH3)
+		return (boolToByte(a.ch3.lenEn) << 6) | byte((a.ch3.freq>>8)&7)
+	case 0xFF30, 0xFF31, 0xFF32, 0xFF33, 0xFF34, 0xFF35, 0xFF36, 0xFF37,
+		0xFF38, 0xFF39, 0xFF3A, 0xFF3B, 0xFF3C, 0xFF3D, 0xFF3E, 0xFF3F:
+		return a.ch3.ram[addr-0xFF30]
+	case 0xFF20: // NR41 length (CH4)
+		return byte(0x3F - (a.ch4.length & 0x3F))
+	case 0xFF21: // NR42 envelope (CH4)
+		dir := byte(0)
+		if a.ch4.envDir > 0 {
+			dir = 1
+		}
+		return (a.ch4.vol << 4) | (dir << 3) | (a.ch4.envPer & 7)
+	case 0xFF22: // NR43 poly counter (CH4)
+		w := byte(0)
+		if a.ch4.width7 {
+			w = 1
+		}
+		return (a.ch4.shift << 4) | (w << 3) | (a.ch4.divSel & 7)
+	case 0xFF23: // NR44 (CH4)
+		return (boolToByte(a.ch4.lenEn) << 6)
 	case 0xFF24:
 		return a.nr50
 	case 0xFF25:
@@ -131,6 +197,12 @@ func (a *APU) CPURead(addr uint16) byte {
 		}
 		if a.ch2.enabled {
 			chFlags |= 1 << 1
+		}
+		if a.ch3.enabled {
+			chFlags |= 1 << 2
+		}
+		if a.ch4.enabled {
+			chFlags |= 1 << 3
 		}
 		return 0x70 | (boolToByte(a.enabled) << 7) | chFlags
 	default:
@@ -189,6 +261,27 @@ func (a *APU) CPUWrite(addr uint16, v byte) {
 		if (v & (1 << 7)) != 0 {
 			a.triggerCh2()
 		}
+	case 0xFF1A: // NR30 (CH3 DAC)
+		a.ch3.dacEn = (v & 0x80) != 0
+		if !a.ch3.dacEn {
+			a.ch3.enabled = false
+		}
+	case 0xFF1B: // NR31 (CH3 length)
+		a.ch3.length = 256 - int(v)
+	case 0xFF1C: // NR32 (CH3 volume)
+		a.ch3.volCode = (v >> 5) & 3
+	case 0xFF1D: // NR33 (CH3 freq lo)
+		a.ch3.freq = (a.ch3.freq & 0x0700) | uint16(v)
+		a.reloadCh3Timer()
+	case 0xFF1E: // NR34 (CH3)
+		a.ch3.lenEn = (v & (1 << 6)) != 0
+		a.ch3.freq = (a.ch3.freq & 0x00FF) | (uint16(v&7) << 8)
+		if (v & (1 << 7)) != 0 {
+			a.triggerCh3()
+		}
+	case 0xFF30, 0xFF31, 0xFF32, 0xFF33, 0xFF34, 0xFF35, 0xFF36, 0xFF37,
+		0xFF38, 0xFF39, 0xFF3A, 0xFF3B, 0xFF3C, 0xFF3D, 0xFF3E, 0xFF3F:
+		a.ch3.ram[addr-0xFF30] = v
 	case 0xFF24:
 		a.nr50 = v
 	case 0xFF25:
@@ -202,6 +295,29 @@ func (a *APU) CPUWrite(addr uint16, v byte) {
 			a.enabled = false
 		} else {
 			a.enabled = true
+		}
+	case 0xFF20: // NR41 (CH4 length)
+		a.ch4.length = 64 - int(v&0x3F)
+	case 0xFF21: // NR42 (CH4 envelope)
+		a.ch4.vol = (v >> 4) & 0x0F
+		if (v & (1 << 3)) != 0 {
+			a.ch4.envDir = 1
+		} else {
+			a.ch4.envDir = -1
+		}
+		a.ch4.envPer = v & 7
+		if (v & 0xF8) == 0 {
+			a.ch4.enabled = false
+		}
+	case 0xFF22: // NR43 (CH4 polynomial)
+		a.ch4.shift = (v >> 4) & 0x0F
+		a.ch4.width7 = (v & (1 << 3)) != 0
+		a.ch4.divSel = v & 7
+		a.reloadCh4Timer()
+	case 0xFF23: // NR44 (CH4)
+		a.ch4.lenEn = (v & (1 << 6)) != 0
+		if (v & (1 << 7)) != 0 {
+			a.triggerCh4()
 		}
 	}
 }
@@ -273,6 +389,59 @@ func (a *APU) reloadCh2Timer() {
 	a.ch2.timer = periodCycles
 }
 
+func (a *APU) reloadCh3Timer() {
+	periodCycles := int(2 * (2048 - (a.ch3.freq & 0x7FF)))
+	if periodCycles < 2 {
+		periodCycles = 2
+	}
+	a.ch3.timer = periodCycles
+}
+
+func (a *APU) triggerCh3() {
+	if !a.ch3.dacEn {
+		a.ch3.enabled = false
+	} else {
+		a.ch3.enabled = true
+	}
+	if a.ch3.length == 0 {
+		a.ch3.length = 256
+	}
+	a.ch3.pos = 0
+	a.reloadCh3Timer()
+}
+
+func (a *APU) triggerCh4() {
+	// DAC off check: if initial volume is 0 and decreasing, mute
+	if a.ch4.vol == 0 && a.ch4.envDir < 0 {
+		a.ch4.enabled = false
+	} else {
+		a.ch4.enabled = true
+	}
+	if a.ch4.length == 0 {
+		a.ch4.length = 64
+	}
+	a.ch4.curVol = a.ch4.vol
+	per := a.ch4.envPer
+	if per == 0 {
+		per = 8
+	}
+	a.ch4.envTmr = per
+	a.ch4.lfsr = 0x7FFF
+	a.reloadCh4Timer()
+}
+
+func (a *APU) reloadCh4Timer() {
+	// Divisor table for CH4 dividing ratio
+	divTable := [8]int{8, 16, 32, 48, 64, 80, 96, 112}
+	div := divTable[int(a.ch4.divSel&7)]
+	// cycles per step ≈ divisor << (shift+4)
+	period := div << (int(a.ch4.shift) + 4)
+	if period < 2 {
+		period = 2
+	}
+	a.ch4.timer = period
+}
+
 // Tick advances the APU by the given number of CPU cycles, and pushes PCM samples when due.
 func (a *APU) Tick(cycles int) {
 	if cycles <= 0 {
@@ -298,7 +467,7 @@ func (a *APU) Tick(cycles int) {
 					a.clockEnvelope()
 				}
 			}
-			// channel 2 timer and phase
+			// channel timers and phase
 			if a.ch1.enabled {
 				a.ch1.timer--
 				if a.ch1.timer <= 0 {
@@ -306,11 +475,34 @@ func (a *APU) Tick(cycles int) {
 					a.ch1.phase = (a.ch1.phase + 1) & 7
 				}
 			}
+			if a.ch3.enabled {
+				a.ch3.timer--
+				if a.ch3.timer <= 0 {
+					a.reloadCh3Timer()
+					a.ch3.pos = (a.ch3.pos + 1) & 31
+				}
+			}
 			if a.ch2.enabled {
 				a.ch2.timer--
 				if a.ch2.timer <= 0 {
 					a.reloadCh2Timer()
 					a.ch2.phase = (a.ch2.phase + 1) & 7
+				}
+			}
+			// channel 4 timer and LFSR
+			if a.ch4.enabled {
+				a.ch4.timer--
+				if a.ch4.timer <= 0 {
+					a.reloadCh4Timer()
+					// XOR of bit0 and bit1, then shift right
+					x := (a.ch4.lfsr ^ (a.ch4.lfsr >> 1)) & 1
+					a.ch4.lfsr >>= 1
+					a.ch4.lfsr |= (x << 14)
+					if a.ch4.width7 {
+						// also put into bit6 for 7-bit mode
+						a.ch4.lfsr &^= 1 << 6
+						a.ch4.lfsr |= (x << 6)
+					}
 				}
 			}
 			// sample generation
@@ -329,6 +521,12 @@ func (a *APU) clockLength() {
 		a.ch1.length--
 		if a.ch1.length <= 0 {
 			a.ch1.enabled = false
+		}
+	}
+	if a.ch3.lenEn && a.ch3.length > 0 {
+		a.ch3.length--
+		if a.ch3.length <= 0 {
+			a.ch3.enabled = false
 		}
 	}
 	if a.ch2.lenEn && a.ch2.length > 0 {
@@ -365,6 +563,20 @@ func (a *APU) clockEnvelope() {
 				a.ch2.curVol++
 			} else if a.ch2.envDir < 0 && a.ch2.curVol > 0 {
 				a.ch2.curVol--
+			}
+		}
+	}
+	// CH4
+	if a.ch4.enabled && a.ch4.envPer != 0 {
+		if a.ch4.envTmr > 0 {
+			a.ch4.envTmr--
+		}
+		if a.ch4.envTmr == 0 {
+			a.ch4.envTmr = a.ch4.envPer
+			if a.ch4.envDir > 0 && a.ch4.curVol < 15 {
+				a.ch4.curVol++
+			} else if a.ch4.envDir < 0 && a.ch4.curVol > 0 {
+				a.ch4.curVol--
 			}
 		}
 	}
@@ -421,6 +633,21 @@ func (a *APU) mixSample() int16 {
 			val += amp
 		}
 	}
+	// CH3 contribution
+	if a.ch3.enabled && a.ch3.dacEn {
+		b := a.ch3.ram[a.ch3.pos>>1]
+		var n4 byte
+		if (a.ch3.pos & 1) == 0 {
+			n4 = (b >> 4) & 0x0F
+		} else {
+			n4 = b & 0x0F
+		}
+		if a.ch3.volCode != 0 {
+			shift := a.ch3.volCode - 1
+			s := float64(n4>>shift) / 15.0
+			val += s
+		}
+	}
 	if a.ch2.enabled {
 		pat := dutyTable[a.ch2.duty]
 		on := pat[a.ch2.phase] != 0
@@ -429,6 +656,14 @@ func (a *APU) mixSample() int16 {
 			val += amp
 		} else {
 			val += 0
+		}
+	}
+	// CH4 contribution
+	if a.ch4.enabled {
+		on := ((^a.ch4.lfsr) & 1) != 0
+		amp := float64(a.ch4.curVol) / 15.0
+		if on {
+			val += amp
 		}
 	}
 	// apply conservative gain and convert to int16
@@ -473,6 +708,8 @@ type apuState struct {
 	FSstep           int
 	Ch1              ch1State
 	Ch2              ch2State
+	Ch3              ch3State
+	Ch4              ch4State
 	CycAccum         float64
 }
 
@@ -512,6 +749,34 @@ type ch2State struct {
 	Phase   int
 }
 
+type ch3State struct {
+	Enabled bool
+	DAC     bool
+	Length  int
+	LenEn   bool
+	VolCode byte
+	Freq    uint16
+	Timer   int
+	Pos     int
+	RAM     [16]byte
+}
+
+type ch4State struct {
+	Enabled bool
+	Length  int
+	LenEn   bool
+	Vol     byte
+	EnvDir  int8
+	EnvPer  byte
+	CurVol  byte
+	EnvTmr  byte
+	Shift   byte
+	Width7  bool
+	DivSel  byte
+	Timer   int
+	LFSR    uint16
+}
+
 func (a *APU) SaveState() []byte {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
@@ -532,6 +797,18 @@ func (a *APU) SaveState() []byte {
 			LenEn: a.ch2.lenEn, Vol: a.ch2.vol, EnvDir: a.ch2.envDir, EnvPer: a.ch2.envPer,
 			CurVol: a.ch2.curVol, EnvTmr: a.ch2.envTmr,
 			Freq: a.ch2.freq, Timer: a.ch2.timer, Phase: a.ch2.phase,
+		},
+		Ch3: ch3State{
+			Enabled: a.ch3.enabled, DAC: a.ch3.dacEn, Length: a.ch3.length, LenEn: a.ch3.lenEn,
+			VolCode: a.ch3.volCode, Freq: a.ch3.freq, Timer: a.ch3.timer, Pos: a.ch3.pos,
+			RAM: a.ch3.ram,
+		},
+		Ch4: ch4State{
+			Enabled: a.ch4.enabled, Length: a.ch4.length, LenEn: a.ch4.lenEn,
+			Vol: a.ch4.vol, EnvDir: a.ch4.envDir, EnvPer: a.ch4.envPer,
+			CurVol: a.ch4.curVol, EnvTmr: a.ch4.envTmr,
+			Shift: a.ch4.shift, Width7: a.ch4.width7, DivSel: a.ch4.divSel,
+			Timer: a.ch4.timer, LFSR: a.ch4.lfsr,
 		},
 		CycAccum: a.cycAccum,
 	}
@@ -578,6 +855,30 @@ func (a *APU) LoadState(data []byte) {
 	a.ch2.freq = s.Ch2.Freq
 	a.ch2.timer = s.Ch2.Timer
 	a.ch2.phase = s.Ch2.Phase
+	// CH3
+	a.ch3.enabled = s.Ch3.Enabled
+	a.ch3.dacEn = s.Ch3.DAC
+	a.ch3.length = s.Ch3.Length
+	a.ch3.lenEn = s.Ch3.LenEn
+	a.ch3.volCode = s.Ch3.VolCode
+	a.ch3.freq = s.Ch3.Freq
+	a.ch3.timer = s.Ch3.Timer
+	a.ch3.pos = s.Ch3.Pos
+	a.ch3.ram = s.Ch3.RAM
+	// CH4
+	a.ch4.enabled = s.Ch4.Enabled
+	a.ch4.length = s.Ch4.Length
+	a.ch4.lenEn = s.Ch4.LenEn
+	a.ch4.vol = s.Ch4.Vol
+	a.ch4.envDir = s.Ch4.EnvDir
+	a.ch4.envPer = s.Ch4.EnvPer
+	a.ch4.curVol = s.Ch4.CurVol
+	a.ch4.envTmr = s.Ch4.EnvTmr
+	a.ch4.shift = s.Ch4.Shift
+	a.ch4.width7 = s.Ch4.Width7
+	a.ch4.divSel = s.Ch4.DivSel
+	a.ch4.timer = s.Ch4.Timer
+	a.ch4.lfsr = s.Ch4.LFSR
 	a.cycAccum = s.CycAccum
 }
 
