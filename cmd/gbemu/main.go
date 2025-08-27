@@ -140,13 +140,18 @@ func main() {
 		}
 		// Mark ROM path on the machine so UI knows a game is loaded
 		if f.ROMPath != "" {
-			// prefer absolute path for state/save placement consistency
 			if abs, err := filepath.Abs(f.ROMPath); err == nil {
-				_ = m.LoadROMFromFile(abs) // reload through file path to set romPath
+				m.SetROMPath(abs)
 			} else {
-				_ = m.LoadROMFromFile(f.ROMPath)
+				m.SetROMPath(f.ROMPath)
 			}
 		}
+	}
+	// Always run via boot ROM if available
+	if m.HasBootROM() {
+		m.ResetWithBoot()
+	} else {
+		m.ResetPostBoot()
 	}
 
 	// Battery RAM: load .sav if present

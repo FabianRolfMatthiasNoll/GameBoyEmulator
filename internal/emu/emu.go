@@ -95,6 +95,10 @@ func (m *Machine) ROMPath() string {
 	return m.romPath
 }
 
+// SetROMPath sets the current ROM path (used by UI for state/save association).
+// This does not reload the ROM and should be called only after a successful cartridge load.
+func (m *Machine) SetROMPath(path string) { m.romPath = path }
+
 // SetBootROM sets the DMG boot ROM to be used when loading ROMs or executing with boot.
 func (m *Machine) SetBootROM(data []byte) {
 	if len(data) >= 0x100 {
@@ -107,6 +111,9 @@ func (m *Machine) SetBootROM(data []byte) {
 		m.bus.SetBootROM(m.bootROM)
 	}
 }
+
+// HasBootROM reports whether a DMG boot ROM is configured on this machine.
+func (m *Machine) HasBootROM() bool { return len(m.bootROM) >= 0x100 }
 
 // ResetPostBoot resets CPU and IO to DMG post-boot state (no boot ROM), keeping the loaded cartridge.
 func (m *Machine) ResetPostBoot() {
