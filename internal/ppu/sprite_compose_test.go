@@ -38,3 +38,32 @@ func TestComposeSpriteLineTieBreaker(t *testing.T) {
 		t.Fatalf("expected a sprite at x=20")
 	}
 }
+
+func TestComposeSpriteLinePaletteSelection(t *testing.T) {
+	mem := mockVRAM{}
+	base := uint16(0x8000)
+	// Make an opaque pixel at bit7
+	mem[base+0] = 0x80
+	mem[base+1] = 0x00
+	// Two overlapping sprites at same X; one selects OBP0, the other OBP1; leftmost X rule should pick X=10
+	s0 := Sprite{X: 10, Y: 0, Tile: 0, Attr: 0 << 4, OAMIndex: 2}   // OBP0
+	s1 := Sprite{X: 11, Y: 0, Tile: 0, Attr: 1<<4 | 0, OAMIndex: 1} // OBP1 but appears to the right, shouldn't win at x=10
+	var bgci [160]byte
+	ci, pal := ComposeSpriteLineExt(mem, []Sprite{s0, s1}, 0, bgci, false)
+	if ci[10] == 0 {
+		t.Fatalf("expected sprite pixel at x=10")
+	}
+	if pal[10] != 0 {
+		t.Fatalf("expected OBP0 at x=10, got pal=%d", pal[10])
+	}
+	// Now put both with same X but different OAM index; lower OAM index should win and carry its palette
+	s0 = Sprite{X: 12, Y: 0, Tile: 0, Attr: 0 << 4, OAMIndex: 5} // OBP0, higher index
+	s1 = Sprite{X: 12, Y: 0, Tile: 0, Attr: 1 << 4, OAMIndex: 3} // OBP1, lower index
+	ci, pal = ComposeSpriteLineExt(mem, []Sprite{s0, s1}, 0, bgci, false)
+	if ci[12] == 0 {
+		t.Fatalf("expected sprite pixel at x=12")
+	}
+	if pal[12] != 1 {
+		t.Fatalf("expected OBP1 at x=12 due to lower OAM index, got pal=%d", pal[12])
+	}
+}

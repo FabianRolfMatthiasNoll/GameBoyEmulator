@@ -642,12 +642,12 @@ func (m *Machine) renderSprites() {
 			if len(sprites) == 0 {
 				continue
 			}
-			// Compose sprite pixels over this line
+			// Compose sprite pixels over this line with per-pixel palette selection
 			var bgciLine [160]byte
 			copy(bgciLine[:], m.bgci[y*m.w:(y+1)*m.w])
 			vr := vramReaderAdapter{ppu: m.bus.PPU()}
-			sline := ppu.ComposeSpriteLine(vr, sprites, y, bgciLine, sprite16)
-			// Shade sprites onto framebuffer where non-zero
+			sline, palSel := ppu.ComposeSpriteLineExt(vr, sprites, y, bgciLine, sprite16)
+			// Shade sprites onto framebuffer where non-zero using OBP0/OBP1 based on palSel
 			shadeP := func(pal byte, ci byte) byte {
 				shift := ci * 2
 				p := (pal >> shift) & 0x03
@@ -668,9 +668,9 @@ func (m *Machine) renderSprites() {
 					continue
 				}
 				pal := obp0
-				if (ci != 0) && (sprites[0].Attr&(1<<4)) != 0 {
+				if palSel[x] == 1 {
 					pal = obp1
-				} // per-pixel attr would require tracking source sprite; approximate: prefer OBP1 when set on any
+				}
 				gray := shadeP(pal, ci)
 				i := (y*m.w + x) * 4
 				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = gray, gray, gray, 0xFF

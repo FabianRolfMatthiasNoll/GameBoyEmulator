@@ -92,12 +92,12 @@ type Sprite struct {
 // ComposeSpriteLine returns per-pixel OBJ color indices for a scanline (0 means transparent/no OBJ).
 // It applies OBJ-to-BG priority: if sprite has priority bit set (behind BG) and bgci[x]!=0, the pixel is skipped.
 // It also enforces leftmost-X and then OAM index as tie-breakers for overlapping sprites at a given x.
-func ComposeSpriteLine(mem VRAMReader, sprites []Sprite, lineY int, bgci [160]byte, sprite16 bool) [160]byte {
-	var out [160]byte // 0 means no sprite drawn at that x
-	var bestX [160]int
+func ComposeSpriteLineExt(mem VRAMReader, sprites []Sprite, lineY int, bgci [160]byte, sprite16 bool) (ciOut [160]byte, palSel [160]byte) {
+	// Track, per screen X, the sprite X chosen (for leftmost-X rule) and its OAM index
+	var bestSX [160]int
 	var bestIdx [160]int
 	for i := 0; i < 160; i++ {
-		bestX[i] = 9999
+		bestSX[i] = 9999
 		bestIdx[i] = 9999
 	}
 	for _, s := range sprites {
@@ -150,13 +150,20 @@ func ComposeSpriteLine(mem VRAMReader, sprites []Sprite, lineY int, bgci [160]by
 					continue
 				}
 			}
-			// leftmost X, then OAM index tie-breaker
-			if screenX < bestX[screenX] || (screenX == bestX[screenX] && s.OAMIndex < bestIdx[screenX]) {
-				out[screenX] = ci
-				bestX[screenX] = screenX
+			// leftmost sprite X wins; if equal X, lower OAM index wins
+			if s.X < bestSX[screenX] || (s.X == bestSX[screenX] && s.OAMIndex < bestIdx[screenX]) {
+				ciOut[screenX] = ci
+				palSel[screenX] = (s.Attr >> 4) & 1
+				bestSX[screenX] = s.X
 				bestIdx[screenX] = s.OAMIndex
 			}
 		}
 	}
-	return out
+	return ciOut, palSel
+}
+
+// Back-compat wrapper that returns only color indices.
+func ComposeSpriteLine(mem VRAMReader, sprites []Sprite, lineY int, bgci [160]byte, sprite16 bool) [160]byte {
+	ci, _ := ComposeSpriteLineExt(mem, sprites, lineY, bgci, sprite16)
+	return ci
 }
