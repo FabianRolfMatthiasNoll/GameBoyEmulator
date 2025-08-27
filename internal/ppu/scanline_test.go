@@ -19,7 +19,7 @@ func TestScanlineFetcherSCXOffsetAndTileWrap(t *testing.T) {
 	}
 
 	// scx=5 should discard first 5 pixels of tile 0, then continue; 160 px output
-	out := renderBGScanlineUsingFetcher(mem, mapBase, true, 5, 0, 0)
+	out := RenderBGScanlineUsingFetcher(mem, mapBase, true, 5, 0, 0)
 	// Validate the first 8-5=3 pixels match tile0 bits 2..0 and next pixels come from tile1 etc.
 	lo0, hi0 := byte(0), ^byte(0)
 	for i := 0; i < 3; i++ {

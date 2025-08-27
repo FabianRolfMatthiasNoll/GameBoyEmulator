@@ -8,6 +8,7 @@ import (
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/bus"
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/cart"
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/cpu"
+	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/ppu"
 )
 
 type Buttons struct {
@@ -72,6 +73,9 @@ func (m *Machine) LoadCartridge(rom []byte, boot []byte) error {
 	}
 	return nil
 }
+
+// SetUseFetcherBG toggles the BG renderer between classic and fetcher-based path.
+func (m *Machine) SetUseFetcherBG(on bool) { m.cfg.UseFetcherBG = on }
 
 // LoadROMFromFile replaces the current cartridge with a ROM from disk, preserving boot ROM setting.
 func (m *Machine) LoadROMFromFile(path string) error {
@@ -330,6 +334,58 @@ func (m *Machine) renderBG() {
 	if m.bus == nil {
 		return
 	}
+	// Optional fast path using fetcher/FIFO per-scanline renderer for BG layer
+	if m.cfg.UseFetcherBG {
+		for y := 0; y < 144; y++ {
+			lr := m.bus.PPU().LineRegs(y)
+			if lr.LCDC == 0 {
+				lr.LCDC = m.bus.Read(0xFF40)
+				lr.SCY = m.bus.Read(0xFF42)
+				lr.SCX = m.bus.Read(0xFF43)
+				lr.BGP = m.bus.Read(0xFF47)
+			}
+			if (lr.LCDC&0x80) == 0 || (lr.LCDC&0x01) == 0 {
+				for x := 0; x < 160; x++ {
+					i := (y*m.w + x) * 4
+					m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = 0xFF, 0xFF, 0xFF, 0xFF
+					m.bgci[y*m.w+x] = 0
+				}
+				continue
+			}
+			bgMapBase := uint16(0x9800)
+			if (lr.LCDC & 0x08) != 0 {
+				bgMapBase = 0x9C00
+			}
+			tileData8000 := (lr.LCDC & 0x10) != 0
+			// Adapter to PPU RawVRAM for VRAMReader interface
+			vr := vramReaderAdapter{ppu: m.bus.PPU()}
+			line := ppu.RenderBGScanlineUsingFetcher(vr, bgMapBase, tileData8000, lr.SCX, lr.SCY, byte(y))
+			// Shade and write out
+			bgp := lr.BGP
+			shade := func(ci byte) byte {
+				shift := ci * 2
+				pal := (bgp >> shift) & 0x03
+				switch pal {
+				case 0:
+					return 0xFF
+				case 1:
+					return 0xC0
+				case 2:
+					return 0x60
+				default:
+					return 0x00
+				}
+			}
+			for x := 0; x < 160; x++ {
+				ci := line[x]
+				s := shade(ci)
+				i := (y*m.w + x) * 4
+				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = s, s, s, 0xFF
+				m.bgci[y*m.w+x] = ci
+			}
+		}
+		return
+	}
 	// We render using per-scanline snapshots captured by the PPU at mode-2 start.
 	// Fallback to live regs will be applied if snapshot is zero.
 	for y := 0; y < 144; y++ {
@@ -404,6 +460,11 @@ func (m *Machine) renderBG() {
 		}
 	}
 }
+
+// vramReaderAdapter adapts the live PPU RawVRAM to the ppu.VRAMReader interface used by the fetcher.
+type vramReaderAdapter struct{ ppu *ppu.PPU }
+
+func (a vramReaderAdapter) Read(addr uint16) byte { return a.ppu.RawVRAM(addr) }
 
 func (m *Machine) renderWindow() {
 	if m.bus == nil {

@@ -8,7 +8,7 @@ package ppu
 // - scx, scy: scroll registers
 // - ly: current scanline (0..143)
 // Output: 160 color indices (0..3)
-func renderBGScanlineUsingFetcher(mem vramReader, mapBase uint16, tileData8000 bool, scx, scy, ly byte) [160]byte {
+func RenderBGScanlineUsingFetcher(mem VRAMReader, mapBase uint16, tileData8000 bool, scx, scy, ly byte) [160]byte {
 	var out [160]byte
 
 	// Compute BG coordinates.

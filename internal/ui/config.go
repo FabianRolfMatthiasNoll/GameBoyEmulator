@@ -9,6 +9,7 @@ type Config struct {
 	AudioAdaptive bool   // adaptive target on underrun
 	AudioBufferMs int    // initial desired buffer in ms (approx)
 	ROMsDir       string // directory to browse for ROMs
+	UseFetcherBG  bool   // render BG via fetcher/FIFO
 	// Later: fullscreen, vsync toggle, key mapping, etc.
 }
 

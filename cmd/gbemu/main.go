@@ -18,12 +18,13 @@ import (
 )
 
 type CLIFlags struct {
-	ROMPath string
-	BootROM string
-	Scale   int
-	Title   string
-	Trace   bool
-	SaveRAM bool // persist battery RAM next to ROM (.sav)
+	ROMPath      string
+	BootROM      string
+	Scale        int
+	Title        string
+	Trace        bool
+	SaveRAM      bool // persist battery RAM next to ROM (.sav)
+	UseFetcherBG bool // render BG using fetcher/FIFO path
 
 	// headless
 	Headless bool
@@ -40,6 +41,7 @@ func parseFlags() CLIFlags {
 	flag.StringVar(&f.Title, "title", "gbemu", "window title")
 	flag.BoolVar(&f.Trace, "trace", false, "CPU trace log")
 	flag.BoolVar(&f.SaveRAM, "save", true, "persist battery RAM to ROM.sav on exit and load on start")
+	flag.BoolVar(&f.UseFetcherBG, "usefetcherbg", false, "render BG via fetcher/FIFO (experimental)")
 
 	// headless options
 	flag.BoolVar(&f.Headless, "headless", false, "run without a window")
@@ -127,8 +129,9 @@ func main() {
 	}
 
 	emuCfg := emu.Config{
-		Trace:    f.Trace,
-		LimitFPS: false, // headless wants max speed
+		Trace:        f.Trace,
+		LimitFPS:     false, // headless wants max speed
+		UseFetcherBG: f.UseFetcherBG,
 	}
 	m := emu.New(emuCfg)
 	if len(boot) >= 0x100 {

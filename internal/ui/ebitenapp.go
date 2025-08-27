@@ -97,6 +97,10 @@ func NewApp(cfg Config, m *emu.Machine) *App {
 	a.currentSlot = 0
 	// init ROM dir input for editing
 	a.romDirInput = cfg.ROMsDir
+	// Propagate rendering config into emulator
+	if m != nil {
+		m.SetUseFetcherBG(a.cfg.UseFetcherBG)
+	}
 	return a
 }
 
@@ -351,7 +355,7 @@ func (a *App) Update() error {
 			}
 		case "settings":
 			// Items: Scale, Audio, Audio Adaptive, ROMs Dir (editable)
-			items := 4
+			items := 5
 			if !a.editingROMDir { // normal navigation when not editing
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) && a.menuIdx > 0 {
 					a.menuIdx--
@@ -393,7 +397,15 @@ func (a *App) Update() error {
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) {
 					a.cfg.AudioAdaptive = !a.cfg.AudioAdaptive
 				}
-			} else if a.menuIdx == 3 { // ROMs Dir edit mode
+			} else if a.menuIdx == 3 && !a.editingROMDir { // BG Renderer
+				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) || inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
+					a.cfg.UseFetcherBG = !a.cfg.UseFetcherBG
+					if a.m != nil {
+						a.m.SetUseFetcherBG(a.cfg.UseFetcherBG)
+					}
+					a.saveSettings()
+				}
+			} else if a.menuIdx == 4 { // ROMs Dir edit mode
 				if !a.editingROMDir {
 					if inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
 						a.editingROMDir = true
@@ -761,6 +773,7 @@ func (a *App) Draw(screen *ebiten.Image) {
 				fmt.Sprintf("Scale: %dx", a.cfg.Scale),
 				fmt.Sprintf("Audio: %s", map[bool]string{true: "Stereo", false: "Mono"}[a.cfg.AudioStereo]),
 				fmt.Sprintf("Audio Adaptive: %s", map[bool]string{true: "On", false: "Off"}[a.cfg.AudioAdaptive]),
+				fmt.Sprintf("BG Renderer: %s", map[bool]string{true: "Fetcher", false: "Classic"}[a.cfg.UseFetcherBG]),
 				fmt.Sprintf("ROMs Dir: %s", a.truncateText(romDir, a.maxCharsForText(10)-11)),
 			}
 			for i, it := range items {
@@ -857,6 +870,10 @@ func loadSettings(override Config) Config {
 	}
 	cfg.AudioStereo = override.AudioStereo || cfg.AudioStereo
 	cfg.AudioAdaptive = override.AudioAdaptive || cfg.AudioAdaptive
+	// boolean override for UseFetcherBG if explicitly set true via code or defaults file
+	if override.UseFetcherBG {
+		cfg.UseFetcherBG = true
+	}
 	if cfg.Title == "" && override.Title == "" {
 		cfg.Title = "gbemu"
 	}

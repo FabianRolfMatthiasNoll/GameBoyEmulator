@@ -3,8 +3,9 @@ package ppu
 // Minimal, isolated BG fetcher + FIFO used for future PPU refactor.
 // This is not wired into rendering yet; unit tests validate behavior.
 
-// vramReader provides read-only access for the fetcher in tests.
-type vramReader interface {
+// VRAMReader provides read-only access for the fetcher or scanline helpers.
+// It abstracts how VRAM bytes are fetched (tests vs. live PPU).
+type VRAMReader interface {
 	Read(addr uint16) byte
 }
 
@@ -39,7 +40,7 @@ func (q *fifo) Pop() (byte, bool) {
 
 // bgFetcher pulls one tile row (8 pixels) into the FIFO.
 type bgFetcher struct {
-	mem           vramReader
+	mem           VRAMReader
 	fifo          *fifo
 	mapBase       uint16 // 0x9800 or 0x9C00
 	tileData8000  bool   // true: 0x8000 addressing; false: 0x8800 signed
@@ -47,7 +48,7 @@ type bgFetcher struct {
 	fineY         byte   // 0..7 within tile
 }
 
-func newBGFetcher(mem vramReader, f *fifo) *bgFetcher { return &bgFetcher{mem: mem, fifo: f} }
+func newBGFetcher(mem VRAMReader, f *fifo) *bgFetcher { return &bgFetcher{mem: mem, fifo: f} }
 
 // Configure sets tilemap and addressing mode for the next fetch.
 func (fch *bgFetcher) Configure(mapBase uint16, tileData8000 bool, tileIndexAddr uint16, fineY byte) {
