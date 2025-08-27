@@ -287,25 +287,42 @@ func (s *apuStream) Read(p []byte) (int, error) {
 	if len(p) == 0 || s == nil || s.m == nil {
 		return 0, nil
 	}
-	// Each sample is 4 bytes (stereo int16). Fill the entire buffer.
+	// Each frame is 4 bytes (stereo int16). Try to fill entire buffer; avoid output underruns.
 	want := len(p) / 4
-	samples := s.m.APUPullSamples(want)
-	// Convert and copy
-	i := 0
-	for _, v := range samples {
-		binary.LittleEndian.PutUint16(p[i:], uint16(v))
-		binary.LittleEndian.PutUint16(p[i+2:], uint16(v))
-		i += 4
+	filled := 0
+	// Keep a simple last-sample for graceful underflows
+	var last int16
+	for filled < want {
+		frames := s.m.APUPullStereo(want - filled)
+		// Convert pulled frames (interleaved) to mono and write both channels
+		i := filled * 4
+		for j := 0; j+1 < len(frames) && i+3 < len(p); j += 2 {
+			l := int32(frames[j])
+			r := int32(frames[j+1])
+			m := int16((l + r) / 2)
+			last = m
+			binary.LittleEndian.PutUint16(p[i:], uint16(m))
+			binary.LittleEndian.PutUint16(p[i+2:], uint16(m))
+			i += 4
+			filled++
+		}
+		if filled >= want {
+			break
+		}
+		// If not enough frames available yet, fill a tiny chunk with last to prevent hard gaps.
+		// This smooths over jitter without adding latency.
+		padFrames := want - filled
+		if padFrames > 8 {
+			padFrames = 8
+		}
+		for k := 0; k < padFrames; k++ {
+			idx := (filled + k) * 4
+			binary.LittleEndian.PutUint16(p[idx:], uint16(last))
+			binary.LittleEndian.PutUint16(p[idx+2:], uint16(last))
+		}
+		filled += padFrames
 	}
-	// Fill remaining with silence
-	for i < len(p) {
-		p[i+0] = 0
-		p[i+1] = 0
-		p[i+2] = 0
-		p[i+3] = 0
-		i += 4
-	}
-	return len(p), nil
+	return filled * 4, nil
 }
 
 func (a *App) Draw(screen *ebiten.Image) {

@@ -28,6 +28,12 @@ type APU struct {
 	bufHead int
 	bufTail int
 
+	// stereo ring buffers (left/right), capacity same power-of-two size
+	sL    []int16
+	sR    []int16
+	sHead int
+	sTail int
+
 	// Mixing registers (not fully used yet)
 	nr50 byte // 0xFF24
 	nr51 byte // 0xFF25
@@ -108,13 +114,18 @@ func New(sampleRate int) *APU {
 		sampleRate = 48000
 	}
 	a := &APU{
-		enabled:         false,
+		enabled:         true,
 		sampleRate:      sampleRate,
 		cyclesPerSample: float64(cpuHz) / float64(sampleRate),
-		mixGain:         0.25, // conservative
+		mixGain:         0.20, // a bit more headroom to reduce clipping
 		fsCounter:       cpuHz / 512,
-		buf:             make([]int16, 8192),
+		buf:             make([]int16, 16384),
+		sL:              make([]int16, 16384),
+		sR:              make([]int16, 16384),
 	}
+	// Sensible stereo defaults: route all channels to both and set max master volume.
+	a.nr50 = 0x77
+	a.nr51 = 0xFF
 	return a
 }
 
@@ -252,6 +263,9 @@ func (a *APU) CPUWrite(addr uint16, v byte) {
 			a.ch2.envDir = -1
 		}
 		a.ch2.envPer = v & 7
+		if (v & 0xF8) == 0 { // DAC off -> channel off
+			a.ch2.enabled = false
+		}
 	case 0xFF18: // NR23
 		a.ch2.freq = (a.ch2.freq & 0x0700) | uint16(v)
 		a.reloadCh2Timer()
@@ -358,6 +372,11 @@ func (a *APU) triggerCh1() {
 }
 
 func (a *APU) triggerCh2() {
+	// If DAC off (NR22 upper 5 bits = 0), do not enable
+	if a.ch2.vol == 0 && a.ch2.envDir < 0 {
+		a.ch2.enabled = false
+		return
+	}
 	a.ch2.enabled = true
 	if a.ch2.length == 0 {
 		a.ch2.length = 64
@@ -509,8 +528,11 @@ func (a *APU) Tick(cycles int) {
 			a.cycAccum += 1
 			for a.cycAccum >= a.cyclesPerSample {
 				a.cycAccum -= a.cyclesPerSample
-				s := a.mixSample()
-				a.pushSample(s)
+				l, r := a.mixSampleStereo()
+				a.pushStereo(l, r)
+				// keep mono buffer in sync by averaging for backward compatibility
+				avg := int32(l) + int32(r)
+				a.pushSample(int16(avg / 2))
 			}
 		}
 	}
@@ -631,6 +653,8 @@ func (a *APU) mixSample() int16 {
 		amp := float64(a.ch1.curVol) / 15.0
 		if on {
 			val += amp
+		} else {
+			val -= amp
 		}
 	}
 	// CH3 contribution
@@ -644,7 +668,13 @@ func (a *APU) mixSample() int16 {
 		}
 		if a.ch3.volCode != 0 {
 			shift := a.ch3.volCode - 1
-			s := float64(n4>>shift) / 15.0
+			scaled := float64(n4 >> shift)
+			max := float64(int(15) >> shift)
+			if max < 1 {
+				max = 1
+			}
+			// center around 0: 0..max -> -1..+1
+			s := (scaled/max)*2.0 - 1.0
 			val += s
 		}
 	}
@@ -655,7 +685,7 @@ func (a *APU) mixSample() int16 {
 		if on {
 			val += amp
 		} else {
-			val += 0
+			val -= amp
 		}
 	}
 	// CH4 contribution
@@ -664,6 +694,8 @@ func (a *APU) mixSample() int16 {
 		amp := float64(a.ch4.curVol) / 15.0
 		if on {
 			val += amp
+		} else {
+			val -= amp
 		}
 	}
 	// apply conservative gain and convert to int16
@@ -675,6 +707,152 @@ func (a *APU) mixSample() int16 {
 		v = -1
 	}
 	return int16(v * 32767)
+}
+
+// mixSampleStereo computes one stereo sample pair according to NR50/NR51.
+func (a *APU) mixSampleStereo() (int16, int16) {
+	// Per-channel instantaneous values in [-1, +1]
+	c1, c2, c3, c4 := 0.0, 0.0, 0.0, 0.0
+	if a.ch1.enabled {
+		pat := dutyTable[a.ch1.duty]
+		on := pat[a.ch1.phase] != 0
+		amp := float64(a.ch1.curVol) / 15.0
+		if on {
+			c1 += amp
+		} else {
+			c1 -= amp
+		}
+	}
+	if a.ch2.enabled {
+		pat := dutyTable[a.ch2.duty]
+		on := pat[a.ch2.phase] != 0
+		amp := float64(a.ch2.curVol) / 15.0
+		if on {
+			c2 += amp
+		} else {
+			c2 -= amp
+		}
+	}
+	if a.ch3.enabled && a.ch3.dacEn {
+		b := a.ch3.ram[a.ch3.pos>>1]
+		var n4 byte
+		if (a.ch3.pos & 1) == 0 {
+			n4 = (b >> 4) & 0x0F
+		} else {
+			n4 = b & 0x0F
+		}
+		if a.ch3.volCode != 0 {
+			shift := a.ch3.volCode - 1
+			scaled := float64(n4 >> shift)
+			max := float64(int(15) >> shift)
+			if max < 1 {
+				max = 1
+			}
+			// center around 0 with correct dynamic range based on volume code
+			c3 += (scaled/max)*2.0 - 1.0
+		}
+	}
+	if a.ch4.enabled {
+		on := ((^a.ch4.lfsr) & 1) != 0
+		amp := float64(a.ch4.curVol) / 15.0
+		if on {
+			c4 += amp
+		} else {
+			c4 -= amp
+		}
+	}
+	// Routing via NR51: lower nibble = right (SO1), upper nibble = left (SO2)
+	rMask := a.nr51 & 0x0F
+	lMask := (a.nr51 >> 4) & 0x0F
+	// Safety: some titles (or boot sequences) leave NR51=0 briefly; route all to both to avoid total silence.
+	if rMask == 0 && lMask == 0 {
+		rMask, lMask = 0x0F, 0x0F
+	}
+	l, r := 0.0, 0.0
+	if (lMask & 0x1) != 0 {
+		l += c1
+	}
+	if (lMask & 0x2) != 0 {
+		l += c2
+	}
+	if (lMask & 0x4) != 0 {
+		l += c3
+	}
+	if (lMask & 0x8) != 0 {
+		l += c4
+	}
+	if (rMask & 0x1) != 0 {
+		r += c1
+	}
+	if (rMask & 0x2) != 0 {
+		r += c2
+	}
+	if (rMask & 0x4) != 0 {
+		r += c3
+	}
+	if (rMask & 0x8) != 0 {
+		r += c4
+	}
+	// Master volumes via NR50: SO1(right) level bits 2-0, SO2(left) bits 6-4
+	// Hardware: levels 0..7 map to 0..1 linearly (0 is silence)
+	rv := float64(a.nr50&0x07) / 7.0
+	lv := float64((a.nr50>>4)&0x07) / 7.0
+	l *= lv
+	r *= rv
+	// Apply overall gain and clamp
+	l *= a.mixGain
+	r *= a.mixGain
+	if l > 1 {
+		l = 1
+	} else if l < -1 {
+		l = -1
+	}
+	if r > 1 {
+		r = 1
+	} else if r < -1 {
+		r = -1
+	}
+	return int16(l * 32767), int16(r * 32767)
+}
+
+// pushStereo pushes a stereo frame to the ring buffers.
+func (a *APU) pushStereo(l, r int16) {
+	next := (a.sHead + 1) & (len(a.sL) - 1)
+	if next == a.sTail {
+		return // drop if full
+	}
+	a.sL[a.sHead] = l
+	a.sR[a.sHead] = r
+	a.sHead = next
+}
+
+// PullStereo returns up to max stereo frames as an interleaved int16 slice [L0,R0,L1,R1,...].
+func (a *APU) PullStereo(max int) []int16 {
+	if max <= 0 || a.sHead == a.sTail {
+		return nil
+	}
+	// Limit by available frames
+	count := 0
+	for i := a.sTail; i != a.sHead && count < max; i = (i + 1) & (len(a.sL) - 1) {
+		count++
+	}
+	out := make([]int16, 0, count*2)
+	for i := 0; i < count; i++ {
+		out = append(out, a.sL[a.sTail], a.sR[a.sTail])
+		a.sTail = (a.sTail + 1) & (len(a.sL) - 1)
+	}
+	return out
+}
+
+// StereoAvailable returns the number of stereo frames currently buffered.
+func (a *APU) StereoAvailable() int {
+	if a.sHead == a.sTail {
+		return 0
+	}
+	if a.sHead >= a.sTail {
+		return a.sHead - a.sTail
+	}
+	return (len(a.sL) - a.sTail) + a.sHead
 }
 
 func (a *APU) pushSample(s int16) {

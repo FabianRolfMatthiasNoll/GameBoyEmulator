@@ -206,6 +206,22 @@ func (m *Machine) APUPullSamples(max int) []int16 {
 	return m.bus.APU().PullSamples(max)
 }
 
+// APUPullStereo returns up to max stereo frames as interleaved int16 L,R pairs.
+func (m *Machine) APUPullStereo(max int) []int16 {
+	if m == nil || m.bus == nil || m.bus.APU() == nil {
+		return nil
+	}
+	return m.bus.APU().PullStereo(max)
+}
+
+// APUBufferedStereo returns the number of stereo frames ready in the APU buffer.
+func (m *Machine) APUBufferedStereo() int {
+	if m == nil || m.bus == nil || m.bus.APU() == nil {
+		return 0
+	}
+	return m.bus.APU().StereoAvailable()
+}
+
 // --- Save/Load state ---
 type machineState struct {
 	Bus []byte
