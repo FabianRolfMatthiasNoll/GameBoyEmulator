@@ -168,14 +168,20 @@ func TestBus_TimerEdges_IgnoredDuringPendingReload(t *testing.T) {
 	// While reload pending, a DIV write falling edge must not increment TIMA
 	// Set divider so input true, then DIV write resets to false => falling
 	b.divInternal = 0x0008
-	if !b.timerInput() { t.Fatalf("expected timer input true before DIV write") }
+	if !b.timerInput() {
+		t.Fatalf("expected timer input true before DIV write")
+	}
 	b.Write(0xFF04, 0x00)
 	if got := b.tima; got != 0x00 {
 		t.Fatalf("TIMA incremented during pending reload on DIV write: got %02X want 00", got)
 	}
 	// Let reload occur now
-	for i := 0; i < 4; i++ { b.Tick(1) }
-	if got := b.tima; got != 0x33 { t.Fatalf("reload did not occur: got %02X want 33", got) }
+	for i := 0; i < 4; i++ {
+		b.Tick(1)
+	}
+	if got := b.tima; got != 0x33 {
+		t.Fatalf("reload did not occur: got %02X want 33", got)
+	}
 }
 
 func TestBus_TIMAOverflow_ReloadTiming_AndCancellation(t *testing.T) {
@@ -236,7 +242,7 @@ func TestBus_TIMAOverflow_ReloadTiming_AndCancellation(t *testing.T) {
 	b.tima = 0xFF
 	b.tma = 0x11
 	b.divInternal = 0x000F
-	b.Tick(1)            // overflow
+	b.Tick(1)             // overflow
 	b.Write(0xFF06, 0x22) // change TMA during pending delay
 	for i := 0; i < 4; i++ {
 		b.Tick(1)

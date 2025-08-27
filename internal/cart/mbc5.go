@@ -108,16 +108,16 @@ func (m *MBC5) LoadRAM(data []byte) {
 
 // SaveState/LoadState for save states
 type mbc5State struct {
-	RAM []byte
-	RomBank uint16
-	RamBank byte
+	RAM        []byte
+	RomBank    uint16
+	RamBank    byte
 	RamEnabled bool
 }
 
 func (m *MBC5) SaveState() []byte {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
-	s := mbc5State{ RAM: append([]byte(nil), m.ram...), RomBank: m.romBank, RamBank: m.ramBank, RamEnabled: m.ramEnabled }
+	s := mbc5State{RAM: append([]byte(nil), m.ram...), RomBank: m.romBank, RamBank: m.ramBank, RamEnabled: m.ramEnabled}
 	_ = enc.Encode(s)
 	return buf.Bytes()
 }
@@ -125,7 +125,11 @@ func (m *MBC5) SaveState() []byte {
 func (m *MBC5) LoadState(data []byte) {
 	var s mbc5State
 	dec := gob.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&s); err != nil { return }
-	if len(m.ram) > 0 && len(s.RAM) > 0 { copy(m.ram, s.RAM) }
+	if err := dec.Decode(&s); err != nil {
+		return
+	}
+	if len(m.ram) > 0 && len(s.RAM) > 0 {
+		copy(m.ram, s.RAM)
+	}
 	m.romBank, m.ramBank, m.ramEnabled = s.RomBank, s.RamBank, s.RamEnabled
 }

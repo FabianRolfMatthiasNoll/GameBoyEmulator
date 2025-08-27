@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"os"
+
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/bus"
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/cart"
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/cpu"
@@ -75,12 +76,16 @@ func (m *Machine) LoadCartridge(rom []byte, boot []byte) error {
 // LoadROMFromFile replaces the current cartridge with a ROM from disk, preserving boot ROM setting.
 func (m *Machine) LoadROMFromFile(path string) error {
 	data, err := os.ReadFile(path)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	var boot []byte
 	if len(m.bootROM) >= 0x100 {
 		boot = m.bootROM
 	}
-	if err := m.LoadCartridge(data, boot); err != nil { return err }
+	if err := m.LoadCartridge(data, boot); err != nil {
+		return err
+	}
 	m.romPath = path
 	return nil
 }
@@ -195,18 +200,24 @@ type machineState struct {
 }
 
 func (m *Machine) SaveState() []byte {
-	if m == nil || m.bus == nil || m.cpu == nil { return nil }
+	if m == nil || m.bus == nil || m.cpu == nil {
+		return nil
+	}
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
-	_ = enc.Encode(machineState{ Bus: m.bus.SaveState(), CPU: m.cpu.SaveState() })
+	_ = enc.Encode(machineState{Bus: m.bus.SaveState(), CPU: m.cpu.SaveState()})
 	return buf.Bytes()
 }
 
 func (m *Machine) LoadState(data []byte) error {
-	if m == nil || m.bus == nil || m.cpu == nil { return nil }
+	if m == nil || m.bus == nil || m.cpu == nil {
+		return nil
+	}
 	var s machineState
 	dec := gob.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&s); err != nil { return err }
+	if err := dec.Decode(&s); err != nil {
+		return err
+	}
 	m.bus.LoadState(s.Bus)
 	m.cpu.LoadState(s.CPU)
 	return nil
@@ -214,13 +225,17 @@ func (m *Machine) LoadState(data []byte) error {
 
 func (m *Machine) SaveStateToFile(path string) error {
 	data := m.SaveState()
-	if len(data) == 0 { return nil }
+	if len(data) == 0 {
+		return nil
+	}
 	return os.WriteFile(path, data, 0644)
 }
 
 func (m *Machine) LoadStateFromFile(path string) error {
 	data, err := os.ReadFile(path)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	return m.LoadState(data)
 }
 func (m *Machine) SetButtons(b Buttons) {

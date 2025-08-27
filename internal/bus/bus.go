@@ -248,9 +248,9 @@ func (b *Bus) Write(addr uint16, value byte) {
 		if oldInput && !b.timerInput() {
 			b.incrementTIMA()
 		}
-			if b.debugTimer {
-				fmt.Printf("[TMR] DIV write -> reset (div=0000) tima=%02X tma=%02X tac=%02X reload=%d\n", b.tima, b.tma, b.tac, b.timaReloadDelay)
-			}
+		if b.debugTimer {
+			fmt.Printf("[TMR] DIV write -> reset (div=0000) tima=%02X tma=%02X tac=%02X reload=%d\n", b.tima, b.tma, b.tac, b.timaReloadDelay)
+		}
 		return
 	case addr == 0xFF05:
 		// Writing TIMA during a pending reload cancels the reload and sets TIMA to the written value.
@@ -258,15 +258,15 @@ func (b *Bus) Write(addr uint16, value byte) {
 		if b.timaReloadDelay > 0 {
 			b.timaReloadDelay = 0
 		}
-			if b.debugTimer {
-				fmt.Printf("[TMR] TIMA write %02X tma=%02X tac=%02X reload=%d\n", value, b.tma, b.tac, b.timaReloadDelay)
-			}
+		if b.debugTimer {
+			fmt.Printf("[TMR] TIMA write %02X tma=%02X tac=%02X reload=%d\n", value, b.tma, b.tac, b.timaReloadDelay)
+		}
 		return
 	case addr == 0xFF06:
 		b.tma = value
-			if b.debugTimer {
-				fmt.Printf("[TMR] TMA write %02X (tima=%02X tac=%02X reload=%d)\n", value, b.tima, b.tac, b.timaReloadDelay)
-			}
+		if b.debugTimer {
+			fmt.Printf("[TMR] TMA write %02X (tima=%02X tac=%02X reload=%d)\n", value, b.tima, b.tac, b.timaReloadDelay)
+		}
 		return
 	case addr == 0xFF07:
 		// Changing TAC can cause a falling edge on the timer input; handle increment accordingly.
@@ -275,9 +275,9 @@ func (b *Bus) Write(addr uint16, value byte) {
 		if oldInput && !b.timerInput() {
 			b.incrementTIMA()
 		}
-			if b.debugTimer {
-				fmt.Printf("[TMR] TAC write %02X (input %v->%v) tima=%02X tma=%02X reload=%d\n", b.tac, oldInput, b.timerInput(), b.tima, b.tma, b.timaReloadDelay)
-			}
+		if b.debugTimer {
+			fmt.Printf("[TMR] TAC write %02X (input %v->%v) tima=%02X tma=%02X reload=%d\n", b.tac, oldInput, b.timerInput(), b.tima, b.tma, b.timaReloadDelay)
+		}
 		return
 	// Serial
 	case addr == 0xFF01:
@@ -435,8 +435,8 @@ func (b *Bus) incrementTIMA() {
 	if b.tima == 0xFF {
 		// Overflow: set to 0x00 now, schedule delayed reload from TMA and IF request
 		b.tima = 0x00
-	// Reload occurs 4 cycles after the overflow, handled in Tick before edge increments
-	b.timaReloadDelay = 4
+		// Reload occurs 4 cycles after the overflow, handled in Tick before edge increments
+		b.timaReloadDelay = 4
 		return
 	}
 	b.tima++
@@ -518,8 +518,8 @@ func (b *Bus) SaveState() []byte {
 		JoypSel: b.joypSelect, Joypad: b.joypad, JoypL4: b.joypLower4,
 		DIV: b.div, TIMA: b.tima, TMA: b.tma, TAC: b.tac, TIMARelay: b.timaReloadDelay,
 		SB: b.sb, SC: b.sc, DivInt: b.divInternal,
-	DMA: b.dma, DMAActive: b.dmaActive, DMASrc: b.dmaSrc, DMAIdx: b.dmaIndex,
-	BootEn: b.bootEnabled,
+		DMA: b.dma, DMAActive: b.dmaActive, DMASrc: b.dmaSrc, DMAIdx: b.dmaIndex,
+		BootEn: b.bootEnabled,
 	}
 	_ = enc.Encode(s)
 	// Append PPU and Cart states after a simple header so we can restore later
@@ -543,7 +543,9 @@ func (b *Bus) SaveState() []byte {
 func (b *Bus) LoadState(data []byte) {
 	dec := gob.NewDecoder(bytes.NewReader(data))
 	var s busState
-	if err := dec.Decode(&s); err != nil { return }
+	if err := dec.Decode(&s); err != nil {
+		return
+	}
 	b.wram = s.WRAM
 	b.hram = s.HRAM
 	b.ie, b.ifReg = s.IE, s.IF

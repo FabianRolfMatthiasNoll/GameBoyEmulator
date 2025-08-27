@@ -338,33 +338,33 @@ func (m *MBC3) LoadRAM(data []byte) {
 
 // SaveState/LoadState for emulator save states (separate from battery footer)
 type mbc3State struct {
-	RAM []byte
+	RAM        []byte
 	RamEnabled bool
-	RomBank byte
-	RamBank byte
-	RtcSel byte
-	RtcSec byte
-	RtcMin byte
-	RtcHour byte
-	RtcDay uint16
-	RtcHalt bool
-	RtcCarry bool
-	Latched bool
-	LSec byte
-	LMin byte
-	LHour byte
-	LDay uint16
-	LHalt bool
-	LCarry bool
-	LastLatch byte
-	LastWall int64
+	RomBank    byte
+	RamBank    byte
+	RtcSel     byte
+	RtcSec     byte
+	RtcMin     byte
+	RtcHour    byte
+	RtcDay     uint16
+	RtcHalt    bool
+	RtcCarry   bool
+	Latched    bool
+	LSec       byte
+	LMin       byte
+	LHour      byte
+	LDay       uint16
+	LHalt      bool
+	LCarry     bool
+	LastLatch  byte
+	LastWall   int64
 }
 
 func (m *MBC3) SaveState() []byte {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 	s := mbc3State{
-		RAM: append([]byte(nil), m.ram...),
+		RAM:        append([]byte(nil), m.ram...),
 		RamEnabled: m.ramEnabled, RomBank: m.romBank, RamBank: m.ramBank, RtcSel: m.rtcSel,
 		RtcSec: m.rtcSec, RtcMin: m.rtcMin, RtcHour: m.rtcHour, RtcDay: m.rtcDay, RtcHalt: m.rtcHalt, RtcCarry: m.rtcCarry,
 		Latched: m.latched, LSec: m.lSec, LMin: m.lMin, LHour: m.lHour, LDay: m.lDay, LHalt: m.lHalt, LCarry: m.lCarry,
@@ -377,8 +377,12 @@ func (m *MBC3) SaveState() []byte {
 func (m *MBC3) LoadState(data []byte) {
 	var s mbc3State
 	dec := gob.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&s); err != nil { return }
-	if len(m.ram) > 0 && len(s.RAM) > 0 { copy(m.ram, s.RAM) }
+	if err := dec.Decode(&s); err != nil {
+		return
+	}
+	if len(m.ram) > 0 && len(s.RAM) > 0 {
+		copy(m.ram, s.RAM)
+	}
 	m.ramEnabled, m.romBank, m.ramBank, m.rtcSel = s.RamEnabled, s.RomBank, s.RamBank, s.RtcSel
 	m.rtcSec, m.rtcMin, m.rtcHour, m.rtcDay, m.rtcHalt, m.rtcCarry = s.RtcSec, s.RtcMin, s.RtcHour, s.RtcDay, s.RtcHalt, s.RtcCarry
 	m.latched, m.lSec, m.lMin, m.lHour, m.lDay, m.lHalt, m.lCarry = s.Latched, s.LSec, s.LMin, s.LHour, s.LDay, s.LHalt, s.LCarry

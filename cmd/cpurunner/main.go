@@ -58,7 +58,9 @@ func main() {
 	var ser bytes.Buffer
 	// Keep a compact serial ring for last N bytes to print on failure
 	serialWindow := *serialWindowFlag
-	if serialWindow < 256 { serialWindow = 256 }
+	if serialWindow < 256 {
+		serialWindow = 256
+	}
 	serRing := make([]byte, serialWindow)
 	serRingIdx := 0
 	serRingFill := 0
@@ -120,15 +122,15 @@ func main() {
 	lastStage := ""
 
 	// ring buffer for recent traces
-	type traceEntry struct{
-		pc uint16
-		op byte
-		cyc int
-		a,f,b,c,d,e,h,l byte
-		sp uint16
-		ime bool
-		ifreg byte
-		ie byte
+	type traceEntry struct {
+		pc                     uint16
+		op                     byte
+		cyc                    int
+		a, f, b, c, d, e, h, l byte
+		sp                     uint16
+		ime                    bool
+		ifreg                  byte
+		ie                     byte
 	}
 	ring := make([]traceEntry, *traceWindow)
 	ringIdx := 0
@@ -144,10 +146,10 @@ func main() {
 		cycles += cyc
 		if *trace || *traceOnFail {
 			te := traceEntry{
-				pc: pc,
-				op: op,
+				pc:  pc,
+				op:  op,
 				cyc: cyc,
-				a: c.A, f: c.F, b: c.B, c: c.C, d: c.D, e: c.E, h: c.H, l: c.L,
+				a:   c.A, f: c.F, b: c.B, c: c.C, d: c.D, e: c.E, h: c.H, l: c.L,
 				sp: c.SP, ime: c.IME, ifreg: b.Read(0xFF0F), ie: b.Read(0xFFFF),
 			}
 			if *trace {

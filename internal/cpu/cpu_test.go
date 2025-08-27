@@ -361,8 +361,8 @@ func TestCPU_ADD_HL_FlagsAndCarry(t *testing.T) {
 		t.Fatalf("ADD HL,BC flags #1 F=%02X (expect Z=1 N=0 H=1 C=0)", c.F)
 	}
 	// Second add: 0xFFFF + 1 = 0x0000, H=1, C=1, Z preserved
-	c.Step() // LD HL
-	c.Step() // LD BC
+	c.Step()   // LD HL
+	c.Step()   // LD BC
 	c.F = 0x00 // Z cleared should remain cleared
 	c.Step()   // ADD HL,BC
 	if (c.F&0x80) != 0 || (c.F&0x40) != 0 || (c.F&0x20) == 0 || (c.F&0x10) == 0 {
@@ -494,16 +494,16 @@ func TestCPU_LD_HL_SP_plus_r8_and_ADD_SP_r8_Flags(t *testing.T) {
 	}
 	b := bus.New(rom)
 	c := New(b)
-	c.Step() // LD SP
-	c.Step() // LD HL,SP-1
+	c.Step()                                                       // LD SP
+	c.Step()                                                       // LD HL,SP-1
 	if c.getHL() != 0xFF0E || (c.F&0x20) == 0 || (c.F&0x10) == 0 { // H=1,C=1
 		t.Fatalf("LD HL,SP-1 flags/HL wrong: HL=%04X F=%02X", c.getHL(), c.F)
 	}
-	c.Step() // ADD SP,+1
+	c.Step()                                                  // ADD SP,+1
 	if c.SP != 0xFF10 || (c.F&0x20) == 0 || (c.F&0x10) != 0 { // H=1,C=0
 		t.Fatalf("ADD SP,+1 flags/SP wrong: SP=%04X F=%02X", c.SP, c.F)
 	}
-	c.Step() // ADD SP,-2
+	c.Step()                                                  // ADD SP,-2
 	if c.SP != 0xFF0E || (c.F&0x20) != 0 || (c.F&0x10) == 0 { // H=0,C=1
 		t.Fatalf("ADD SP,-2 flags/SP wrong: SP=%04X F=%02X", c.SP, c.F)
 	}
@@ -525,8 +525,8 @@ func TestCPU_POP_AF_MasksFlagsLowNibble(t *testing.T) {
 	// Overwrite stack memory directly to simulate flags with low nibble set
 	sp := c.SP
 	// AF was pushed at [SP..SP+1]; write 0x34 for A and 0xFF for F to test masking
-	b.Write(sp, 0x34)     // low byte (F)
-	b.Write(sp+1, 0x12)   // high byte (A)
+	b.Write(sp, 0x34)   // low byte (F)
+	b.Write(sp+1, 0x12) // high byte (A)
 	// POP AF should load A=0x12 and F masked to 0xF0 (from 0x34 -> 0x30)
 	c.Step()
 	if c.A != 0x12 {
@@ -550,22 +550,22 @@ func TestCPU_UnprefixedRotates_ClearZ(t *testing.T) {
 	c.A = 0x00
 	c.F = 0x80 // Z set initially
 	c.Step()
-	if (c.F&0x80) != 0 {
+	if (c.F & 0x80) != 0 {
 		t.Fatalf("RLCA should clear Z, F=%02X", c.F)
 	}
 	c.F = 0x80
 	c.Step()
-	if (c.F&0x80) != 0 {
+	if (c.F & 0x80) != 0 {
 		t.Fatalf("RRCA should clear Z, F=%02X", c.F)
 	}
 	c.F = 0x90 // carry set
 	c.Step()
-	if (c.F&0x80) != 0 {
+	if (c.F & 0x80) != 0 {
 		t.Fatalf("RLA should clear Z, F=%02X", c.F)
 	}
 	c.F = 0x10 // carry set, Z clear already
 	c.Step()
-	if (c.F&0x80) != 0 {
+	if (c.F & 0x80) != 0 {
 		t.Fatalf("RRA should clear Z, F=%02X", c.F)
 	}
 }
@@ -574,9 +574,9 @@ func TestCPU_CCF_SCF_CPL_Flags(t *testing.T) {
 	// Verify flag behavior for CCF/SCF/CPL
 	rom := []byte{
 		0x3E, 0x00, // LD A,00
-		0x37,       // SCF: C=1, Z preserved, N=H=0
-		0x3F,       // CCF: toggle C
-		0x2F,       // CPL: A=~A, N=H=1, Z unchanged, C unchanged
+		0x37, // SCF: C=1, Z preserved, N=H=0
+		0x3F, // CCF: toggle C
+		0x2F, // CPL: A=~A, N=H=1, Z unchanged, C unchanged
 	}
 	b := bus.New(rom)
 	c := New(b)
@@ -661,30 +661,58 @@ func TestCPU_LD_r_from_HL_CyclesAndBehavior(t *testing.T) {
 	b.Write(0xC000, 0x5A)
 
 	// LD HL; LD B,(HL)
-	if cyc := c.Step(); cyc != 12 || c.getHL() != 0xC000 { t.Fatalf("LD HL,d16 failed: cyc=%d HL=%04X", cyc, c.getHL()) }
-	if cyc := c.Step(); cyc != 8 || c.B != 0x5A { t.Fatalf("LD B,(HL) cyc=%d B=%02X", cyc, c.B) }
+	if cyc := c.Step(); cyc != 12 || c.getHL() != 0xC000 {
+		t.Fatalf("LD HL,d16 failed: cyc=%d HL=%04X", cyc, c.getHL())
+	}
+	if cyc := c.Step(); cyc != 8 || c.B != 0x5A {
+		t.Fatalf("LD B,(HL) cyc=%d B=%02X", cyc, c.B)
+	}
 
 	// LD HL; LD C,(HL)
-	if cyc := c.Step(); cyc != 12 || c.getHL() != 0xC000 { t.Fatalf("LD HL,d16 failed: cyc=%d HL=%04X", cyc, c.getHL()) }
-	if cyc := c.Step(); cyc != 8 || c.C != 0x5A { t.Fatalf("LD C,(HL) cyc=%d C=%02X", cyc, c.C) }
+	if cyc := c.Step(); cyc != 12 || c.getHL() != 0xC000 {
+		t.Fatalf("LD HL,d16 failed: cyc=%d HL=%04X", cyc, c.getHL())
+	}
+	if cyc := c.Step(); cyc != 8 || c.C != 0x5A {
+		t.Fatalf("LD C,(HL) cyc=%d C=%02X", cyc, c.C)
+	}
 
 	// LD HL; LD D,(HL)
-	if cyc := c.Step(); cyc != 12 || c.getHL() != 0xC000 { t.Fatalf("LD HL,d16 failed: cyc=%d HL=%04X", cyc, c.getHL()) }
-	if cyc := c.Step(); cyc != 8 || c.D != 0x5A { t.Fatalf("LD D,(HL) cyc=%d D=%02X", cyc, c.D) }
+	if cyc := c.Step(); cyc != 12 || c.getHL() != 0xC000 {
+		t.Fatalf("LD HL,d16 failed: cyc=%d HL=%04X", cyc, c.getHL())
+	}
+	if cyc := c.Step(); cyc != 8 || c.D != 0x5A {
+		t.Fatalf("LD D,(HL) cyc=%d D=%02X", cyc, c.D)
+	}
 
 	// LD HL; LD E,(HL)
-	if cyc := c.Step(); cyc != 12 || c.getHL() != 0xC000 { t.Fatalf("LD HL,d16 failed: cyc=%d HL=%04X", cyc, c.getHL()) }
-	if cyc := c.Step(); cyc != 8 || c.E != 0x5A { t.Fatalf("LD E,(HL) cyc=%d E=%02X", cyc, c.E) }
+	if cyc := c.Step(); cyc != 12 || c.getHL() != 0xC000 {
+		t.Fatalf("LD HL,d16 failed: cyc=%d HL=%04X", cyc, c.getHL())
+	}
+	if cyc := c.Step(); cyc != 8 || c.E != 0x5A {
+		t.Fatalf("LD E,(HL) cyc=%d E=%02X", cyc, c.E)
+	}
 
 	// LD HL; LD H,(HL)
-	if cyc := c.Step(); cyc != 12 || c.getHL() != 0xC000 { t.Fatalf("LD HL,d16 failed: cyc=%d HL=%04X", cyc, c.getHL()) }
-	if cyc := c.Step(); cyc != 8 || c.H != 0x5A { t.Fatalf("LD H,(HL) cyc=%d H=%02X", cyc, c.H) }
+	if cyc := c.Step(); cyc != 12 || c.getHL() != 0xC000 {
+		t.Fatalf("LD HL,d16 failed: cyc=%d HL=%04X", cyc, c.getHL())
+	}
+	if cyc := c.Step(); cyc != 8 || c.H != 0x5A {
+		t.Fatalf("LD H,(HL) cyc=%d H=%02X", cyc, c.H)
+	}
 
 	// LD HL; LD L,(HL)
-	if cyc := c.Step(); cyc != 12 || c.getHL() != 0xC000 { t.Fatalf("LD HL,d16 failed: cyc=%d HL=%04X", cyc, c.getHL()) }
-	if cyc := c.Step(); cyc != 8 || c.L != 0x5A { t.Fatalf("LD L,(HL) cyc=%d L=%02X", cyc, c.L) }
+	if cyc := c.Step(); cyc != 12 || c.getHL() != 0xC000 {
+		t.Fatalf("LD HL,d16 failed: cyc=%d HL=%04X", cyc, c.getHL())
+	}
+	if cyc := c.Step(); cyc != 8 || c.L != 0x5A {
+		t.Fatalf("LD L,(HL) cyc=%d L=%02X", cyc, c.L)
+	}
 
 	// LD HL; LD A,(HL)
-	if cyc := c.Step(); cyc != 12 || c.getHL() != 0xC000 { t.Fatalf("LD HL,d16 failed: cyc=%d HL=%04X", cyc, c.getHL()) }
-	if cyc := c.Step(); cyc != 8 || c.A != 0x5A { t.Fatalf("LD A,(HL) cyc=%d A=%02X", cyc, c.A) }
+	if cyc := c.Step(); cyc != 12 || c.getHL() != 0xC000 {
+		t.Fatalf("LD HL,d16 failed: cyc=%d HL=%04X", cyc, c.getHL())
+	}
+	if cyc := c.Step(); cyc != 8 || c.A != 0x5A {
+		t.Fatalf("LD A,(HL) cyc=%d A=%02X", cyc, c.A)
+	}
 }

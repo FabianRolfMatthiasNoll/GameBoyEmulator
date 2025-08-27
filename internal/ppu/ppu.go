@@ -312,22 +312,22 @@ func (p *PPU) WX() byte   { return p.wx }
 
 // --- Save/Load state ---
 type ppuState struct {
-	VRAM [0x2000]byte
-	OAM  [0xA0]byte
-	LCDC byte
-	STAT byte
-	SCY  byte
-	SCX  byte
-	LY   byte
-	LYC  byte
-	BGP  byte
-	OBP0 byte
-	OBP1 byte
-	WY   byte
-	WX   byte
-	DOT  int
+	VRAM     [0x2000]byte
+	OAM      [0xA0]byte
+	LCDC     byte
+	STAT     byte
+	SCY      byte
+	SCX      byte
+	LY       byte
+	LYC      byte
+	BGP      byte
+	OBP0     byte
+	OBP1     byte
+	WY       byte
+	WX       byte
+	DOT      int
 	LineRegs [154]LineRegs
-	WinLine byte
+	WinLine  byte
 }
 
 func (p *PPU) SaveState() []byte {
@@ -346,7 +346,9 @@ func (p *PPU) SaveState() []byte {
 func (p *PPU) LoadState(data []byte) {
 	var s ppuState
 	dec := gob.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&s); err != nil { return }
+	if err := dec.Decode(&s); err != nil {
+		return
+	}
 	p.vram = s.VRAM
 	p.oam = s.OAM
 	p.lcdc, p.stat, p.scy, p.scx, p.ly, p.lyc = s.LCDC, s.STAT, s.SCY, s.SCX, s.LY, s.LYC

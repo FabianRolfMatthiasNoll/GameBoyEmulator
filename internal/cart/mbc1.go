@@ -130,22 +130,22 @@ func (m *MBC1) LoadRAM(data []byte) {
 
 // SaveState/LoadState for save states
 type mbc1State struct {
-	RAM                 []byte
-	RomBankLow5         byte
-	RamBankOrRomHigh2   byte
-	RamEnabled          bool
-	ModeSelect          byte
+	RAM               []byte
+	RomBankLow5       byte
+	RamBankOrRomHigh2 byte
+	RamEnabled        bool
+	ModeSelect        byte
 }
 
 func (m *MBC1) SaveState() []byte {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 	s := mbc1State{
-		RAM: append([]byte(nil), m.ram...),
-		RomBankLow5: m.romBankLow5,
+		RAM:               append([]byte(nil), m.ram...),
+		RomBankLow5:       m.romBankLow5,
 		RamBankOrRomHigh2: m.ramBankOrRomHigh2,
-		RamEnabled: m.ramEnabled,
-		ModeSelect: m.modeSelect,
+		RamEnabled:        m.ramEnabled,
+		ModeSelect:        m.modeSelect,
 	}
 	_ = enc.Encode(s)
 	return buf.Bytes()
@@ -154,7 +154,9 @@ func (m *MBC1) SaveState() []byte {
 func (m *MBC1) LoadState(data []byte) {
 	var s mbc1State
 	dec := gob.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&s); err != nil { return }
+	if err := dec.Decode(&s); err != nil {
+		return
+	}
 	if len(m.ram) > 0 && len(s.RAM) > 0 {
 		copy(m.ram, s.RAM)
 	}
