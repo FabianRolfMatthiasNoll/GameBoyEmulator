@@ -16,3 +16,5 @@ testroms/**/*.gbc
 
 *.savestate
 *.png
+*/dist/*
+gbemu_settings.json

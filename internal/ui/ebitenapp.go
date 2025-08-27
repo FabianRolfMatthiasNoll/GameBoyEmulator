@@ -46,6 +46,9 @@ type App struct {
 	targetFrames int // desired stereo frames in buffer
 	stableTicks  int // ticks since last underrun
 
+	// save-state slot management
+	currentSlot int // 0..9
+
 	// rom picker state
 	romList []string
 	romSel  int
@@ -53,6 +56,10 @@ type App struct {
 
 	// keybindings state
 	keysOff int // scroll offset for keybindings
+
+	// settings edit state
+	editingROMDir bool
+	romDirInput   string
 
 	// toast feedback
 	toastMsg   string
@@ -77,7 +84,7 @@ func NewApp(cfg Config, m *emu.Machine) *App {
 	a.targetFrames = (cfg.AudioBufferMs * 48000) / 1000
 	a.stableTicks = 0
 	// Defer creating the player until Update runs to ensure window init isn't blocked
-	// If no ROM is loaded yet, open the ROM picker automatically
+	// If no ROM is loaded yet by the machine, open the ROM picker automatically
 	if m != nil && m.ROMPath() == "" {
 		a.showMenu = true
 		a.menuMode = "rom"
@@ -86,6 +93,10 @@ func NewApp(cfg Config, m *emu.Machine) *App {
 		a.romSel = 0
 		a.romOff = 0
 	}
+	// default save-state slot
+	a.currentSlot = 0
+	// init ROM dir input for editing
+	a.romDirInput = cfg.ROMsDir
 	return a
 }
 
@@ -97,7 +108,6 @@ func (a *App) SaveSettings() { a.saveSettings() }
 func (a *App) Update() error {
 	// Lazy-create audio player on first update to avoid startup blocking before the window appears
 	if a.audioPlayer == nil {
-		// Prefill a bit to prevent initial underruns BEFORE starting the player
 		for i := 0; i < 12; i++ {
 			a.m.StepFrame()
 		}
@@ -138,28 +148,23 @@ func (a *App) Update() error {
 	} else {
 		a.m.SetButtons(emu.Buttons{})
 	}
-
 	// Pause toggle (P)
 	if inpututil.IsKeyJustPressed(ebiten.KeyP) {
 		a.paused = !a.paused
 	}
-
-	// Fast-forward (Tab): while held, run multiple frames per Ebiten update
+	// Fast-forward (Tab)
 	a.fast = ebiten.IsKeyPressed(ebiten.KeyTab)
-
-	// Reset shortcuts
-	if inpututil.IsKeyJustPressed(ebiten.KeyR) { // post-boot reset
+	// Resets
+	if inpututil.IsKeyJustPressed(ebiten.KeyR) {
 		a.m.ResetPostBoot()
 	}
-	if inpututil.IsKeyJustPressed(ebiten.KeyB) { // boot ROM reset
+	if inpututil.IsKeyJustPressed(ebiten.KeyB) {
 		a.m.ResetWithBoot()
 	}
-
 	// Frame-step when paused (N)
 	if !a.showMenu && a.paused && inpututil.IsKeyJustPressed(ebiten.KeyN) {
 		a.m.StepFrame()
 	}
-
 	// Toggle menu (Escape)
 	if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
 		a.showMenu = !a.showMenu
@@ -168,6 +173,47 @@ func (a *App) Update() error {
 			a.menuIdx = 0
 		}
 	}
+	// Fullscreen toggle (F11)
+	if inpututil.IsKeyJustPressed(ebiten.KeyF11) {
+		ebiten.SetFullscreen(!ebiten.IsFullscreen())
+	}
+	// Quick slots (1..4) and quick save/load (F5/F9)
+	// number keys 1..4 map to slots 1..4
+	if inpututil.IsKeyJustPressed(ebiten.Key1) {
+		a.currentSlot = 0
+		a.toast("Slot set to 1")
+	}
+	if inpututil.IsKeyJustPressed(ebiten.Key2) {
+		a.currentSlot = 1
+		a.toast("Slot set to 2")
+	}
+	if inpututil.IsKeyJustPressed(ebiten.Key3) {
+		a.currentSlot = 2
+		a.toast("Slot set to 3")
+	}
+	if inpututil.IsKeyJustPressed(ebiten.Key4) {
+		a.currentSlot = 3
+		a.toast("Slot set to 4")
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyF5) {
+		if err := a.saveSlot(a.currentSlot); err == nil {
+			a.toast(fmt.Sprintf("Saved slot %d", a.currentSlot+1))
+		} else {
+			a.toast("Save failed: " + err.Error())
+		}
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyF9) {
+		if _, err := os.Stat(a.statePath(a.currentSlot)); err != nil {
+			a.toast("Slot is empty")
+		} else {
+			if err := a.loadSlot(a.currentSlot); err == nil {
+				a.toast(fmt.Sprintf("Loaded slot %d", a.currentSlot+1))
+			} else {
+				a.toast("Load failed: " + err.Error())
+			}
+		}
+	}
+
 	// Apply mute when paused or menu shown; reset pacing on transitions
 	muted := a.paused || a.showMenu
 	if muted != a.audioMuted {
@@ -175,11 +221,11 @@ func (a *App) Update() error {
 		a.lastTime = time.Now()
 		a.frameAcc = 0
 	}
+
 	if a.showMenu {
 		switch a.menuMode {
 		case "main":
-			// Navigate main menu (Save, Load, Switch ROM, Settings, Keybindings, Close)
-			max := 5
+			max := 6
 			if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) && a.menuIdx > 0 {
 				a.menuIdx--
 			}
@@ -188,43 +234,70 @@ func (a *App) Update() error {
 			}
 			if inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
 				switch a.menuIdx {
-				case 0: // Save (slot 0)
-					if err := a.saveSlot(0); err == nil {
-						a.toast("Saved slot 0")
+				case 0:
+					if err := a.saveSlot(a.currentSlot); err == nil {
+						a.toast(fmt.Sprintf("Saved slot %d", a.currentSlot+1))
 					} else {
 						a.toast("Save failed: " + err.Error())
 					}
-				case 1: // Load (slot 0)
-					if err := a.loadSlot(0); err == nil {
-						a.toast("Loaded slot 0")
+				case 1:
+					if _, err := os.Stat(a.statePath(a.currentSlot)); err != nil {
+						a.toast("Slot is empty")
 					} else {
-						a.toast("Load failed: " + err.Error())
+						if err := a.loadSlot(a.currentSlot); err == nil {
+							a.toast(fmt.Sprintf("Loaded slot %d", a.currentSlot+1))
+						} else {
+							a.toast("Load failed: " + err.Error())
+						}
 					}
-				case 2: // Switch ROM
+				case 2:
+					a.menuMode = "slot"
+					a.menuIdx = a.currentSlot
+				case 3:
 					a.romList = a.findROMs()
 					a.romSel = 0
 					a.romOff = 0
 					a.menuMode = "rom"
-				case 3: // Settings
+				case 4:
 					a.menuMode = "settings"
 					a.menuIdx = 0
-				case 4: // Keybindings
+					a.editingROMDir = false
+				case 5:
 					a.menuMode = "keys"
 					a.keysOff = 0
-				case 5: // Close
+				case 6:
 					a.showMenu = false
 				}
 			}
+			// Back with Backspace
+			if inpututil.IsKeyJustPressed(ebiten.KeyBackspace) {
+				a.showMenu = false
+			}
+		case "slot":
+			if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) && a.menuIdx > 0 {
+				a.menuIdx--
+			}
+			if inpututil.IsKeyJustPressed(ebiten.KeyArrowDown) && a.menuIdx < 3 {
+				a.menuIdx++
+			}
+			if inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
+				a.currentSlot = a.menuIdx
+				a.toast(fmt.Sprintf("Slot set to %d", a.currentSlot+1))
+				a.menuMode = "main"
+			}
+			if inpututil.IsKeyJustPressed(ebiten.KeyEscape) || inpututil.IsKeyJustPressed(ebiten.KeyBackspace) {
+				a.menuMode = "main"
+			}
 		case "rom":
-			// ROM picker
 			n := len(a.romList)
 			if n == 0 {
-				if inpututil.IsKeyJustPressed(ebiten.KeyEnter) || inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
+				if inpututil.IsKeyJustPressed(ebiten.KeyEnter) || inpututil.IsKeyJustPressed(ebiten.KeyEscape) || inpututil.IsKeyJustPressed(ebiten.KeyBackspace) {
 					a.menuMode = "main"
 				}
 			} else {
-				// visible rows
+				// compute window
 				baseY := 28
+				_ = baseY // draw uses same baseline; keep logic consistent
 				maxRows := (144 - baseY) / 14
 				if maxRows < 1 {
 					maxRows = 1
@@ -235,7 +308,6 @@ func (a *App) Update() error {
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowDown) && a.romSel < n-1 {
 					a.romSel++
 				}
-				// maintain scrolling window
 				if a.romSel < a.romOff {
 					a.romOff = a.romSel
 				}
@@ -252,7 +324,6 @@ func (a *App) Update() error {
 					path := a.romList[a.romSel]
 					if err := a.m.LoadROMFromFile(path); err == nil {
 						a.toast("Loaded ROM: " + filepath.Base(path))
-						// Try to load battery save next to ROM
 						if strings.HasSuffix(strings.ToLower(path), ".gb") {
 							sav := strings.TrimSuffix(path, ".gb") + ".sav"
 							if data, err := os.ReadFile(sav); err == nil {
@@ -264,33 +335,32 @@ func (a *App) Update() error {
 					}
 					a.menuMode = "main"
 				}
-				if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
+				if inpututil.IsKeyJustPressed(ebiten.KeyEscape) || inpututil.IsKeyJustPressed(ebiten.KeyBackspace) {
 					a.menuMode = "main"
 				}
 			}
 		case "keys":
-			// Scrollable keybindings list
 			if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) && a.keysOff > 0 {
 				a.keysOff--
 			}
-			// compute how many rows fit to clamp scrolling down in draw; allow down here freely
 			if inpututil.IsKeyJustPressed(ebiten.KeyArrowDown) {
 				a.keysOff++
 			}
-			if inpututil.IsKeyJustPressed(ebiten.KeyEnter) || inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
+			if inpututil.IsKeyJustPressed(ebiten.KeyEnter) || inpututil.IsKeyJustPressed(ebiten.KeyEscape) || inpututil.IsKeyJustPressed(ebiten.KeyBackspace) {
 				a.menuMode = "main"
 			}
 		case "settings":
-			// Select a setting with Up/Down; change with Left/Right.
-			// Items: Scale, Audio Output, Audio Adaptive
-			items := 3
-			if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) && a.menuIdx > 0 {
-				a.menuIdx--
+			// Items: Scale, Audio, Audio Adaptive, ROMs Dir (editable)
+			items := 4
+			if !a.editingROMDir { // normal navigation when not editing
+				if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) && a.menuIdx > 0 {
+					a.menuIdx--
+				}
+				if inpututil.IsKeyJustPressed(ebiten.KeyArrowDown) && a.menuIdx < items-1 {
+					a.menuIdx++
+				}
 			}
-			if inpututil.IsKeyJustPressed(ebiten.KeyArrowDown) && a.menuIdx < items-1 {
-				a.menuIdx++
-			}
-			if a.menuIdx == 0 { // Scale
+			if a.menuIdx == 0 && !a.editingROMDir { // Scale
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) {
 					if a.cfg.Scale > 1 {
 						a.cfg.Scale--
@@ -303,31 +373,63 @@ func (a *App) Update() error {
 						ebiten.SetWindowSize(160*a.cfg.Scale, 144*a.cfg.Scale)
 					}
 				}
-			} else if a.menuIdx == 1 { // Audio Output
+			} else if a.menuIdx == 1 && !a.editingROMDir { // Audio Output
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) {
 					a.cfg.AudioStereo = !a.cfg.AudioStereo
-					// Recreate player with new mono/stereo mode
 					if a.audioPlayer != nil {
 						a.audioPlayer.Close()
 						a.audioPlayer = nil
 					}
-					// Prefill some frames by stepping emulation to reduce initial underruns
 					for i := 0; i < 12; i++ {
 						a.m.StepFrame()
 					}
-					// Create a streaming player that pulls from the emulator APU (after prefill)
 					a.audioSrc = &apuStream{m: a.m, mono: !a.cfg.AudioStereo, muted: &a.audioMuted}
 					if p, err := a.audioCtx.NewPlayer(a.audioSrc); err == nil {
 						a.audioPlayer = p
 						a.audioPlayer.Play()
 					}
-				} else if a.menuIdx == 2 { // Audio Adaptive
-					if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) {
-						a.cfg.AudioAdaptive = !a.cfg.AudioAdaptive
+				}
+			} else if a.menuIdx == 2 && !a.editingROMDir { // Audio Adaptive
+				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) {
+					a.cfg.AudioAdaptive = !a.cfg.AudioAdaptive
+				}
+			} else if a.menuIdx == 3 { // ROMs Dir edit mode
+				if !a.editingROMDir {
+					if inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
+						a.editingROMDir = true
+						a.romDirInput = a.cfg.ROMsDir
+					}
+					if inpututil.IsKeyJustPressed(ebiten.KeyEscape) || inpututil.IsKeyJustPressed(ebiten.KeyBackspace) {
+						a.menuMode = "main"
+					}
+				} else {
+					// editing: collect typed characters
+					for _, r := range ebiten.InputChars() {
+						if r != '\n' && r != '\r' {
+							a.romDirInput += string(r)
+						}
+					}
+					if inpututil.IsKeyJustPressed(ebiten.KeyBackspace) && len(a.romDirInput) > 0 {
+						a.romDirInput = a.romDirInput[:len(a.romDirInput)-1]
+					}
+					if inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
+						val := strings.TrimSpace(a.romDirInput)
+						if val != "" {
+							a.cfg.ROMsDir = val
+							a.saveSettings()
+							a.romList = a.findROMs()
+							a.toast("ROMs dir set")
+						}
+						a.editingROMDir = false
+					}
+					if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
+						a.editingROMDir = false
+						a.romDirInput = a.cfg.ROMsDir
 					}
 				}
 			}
-			if inpututil.IsKeyJustPressed(ebiten.KeyEnter) || inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
+			// back to main from settings when not editing
+			if !a.editingROMDir && (inpututil.IsKeyJustPressed(ebiten.KeyEnter) || inpututil.IsKeyJustPressed(ebiten.KeyEscape) || inpututil.IsKeyJustPressed(ebiten.KeyBackspace)) {
 				a.menuMode = "main"
 			}
 		}
@@ -516,8 +618,9 @@ func (a *App) Draw(screen *ebiten.Image) {
 		case "main":
 			lines := []string{
 				"Menu:",
-				"  Save state (slot 0)",
-				"  Load state (slot 0)",
+				fmt.Sprintf("  Save state (slot %d)", a.currentSlot+1),
+				fmt.Sprintf("  Load state (slot %d)", a.currentSlot+1),
+				"  Select Slot",
 				"  Switch ROM",
 				"  Settings",
 				"  Keybindings",
@@ -530,12 +633,42 @@ func (a *App) Draw(screen *ebiten.Image) {
 				}
 				ebitenutil.DebugPrintAt(screen, prefix+s, 10, 10+i*14)
 			}
-		case "rom":
-			ebitenutil.DebugPrintAt(screen, "Select ROM (Enter to load, Esc back)", 10, 10)
-			if len(a.romList) == 0 {
-				ebitenutil.DebugPrintAt(screen, "No .gb files found in testroms/", 10, 28)
+			// quick hints, keep on-screen
+			hint := "F5: Save  F9: Load  1-4: Slot  F11: Fullscreen  Backspace: Back"
+			maxChars := a.maxCharsForText(10)
+			if len(hint) > maxChars {
+				hint = a.truncateText(hint, maxChars)
 			}
-			baseY := 28
+			ebitenutil.DebugPrintAt(screen, hint, 10, 10+len(lines)*14)
+		case "slot":
+			// Show 4 slots, gray out empty ones
+			lines := []string{"Select Slot:"}
+			for i := 0; i < 4; i++ {
+				state := "(empty)"
+				if _, err := os.Stat(a.statePath(i)); err == nil {
+					state = ""
+				}
+				label := fmt.Sprintf("  %d %s", i+1, state)
+				lines = append(lines, label)
+			}
+			for i, s := range lines {
+				prefix := "  "
+				if i == a.menuIdx+1 {
+					prefix = "> "
+				}
+				text := prefix + strings.ReplaceAll(s, "(empty)", "[empty]")
+				ebitenutil.DebugPrintAt(screen, text, 10, 10+i*14)
+			}
+		case "rom":
+			ebitenutil.DebugPrintAt(screen, "Select ROM (Enter to load, Backspace/Esc to return)", 10, 10)
+			// show configured ROMs directory
+			d := a.cfg.ROMsDir
+			d = a.truncateText("Dir: "+d, a.maxCharsForText(10))
+			ebitenutil.DebugPrintAt(screen, d, 10, 24)
+			if len(a.romList) == 0 {
+				ebitenutil.DebugPrintAt(screen, "No ROMs found", 10, 40)
+			}
+			baseY := 40
 			maxRows := (144 - baseY) / 14
 			if maxRows < 1 {
 				maxRows = 1
@@ -566,7 +699,7 @@ func (a *App) Draw(screen *ebiten.Image) {
 				ebitenutil.DebugPrintAt(screen, "v", 2, baseY+(maxRows-1)*14)
 			}
 		case "keys":
-			title := "Keybindings (Up/Down to scroll, Enter/Esc to return)"
+			title := "Keybindings (Up/Down to scroll, Backspace/Esc to return)"
 			cursorY := 10
 			for _, w := range a.wrapText(title, a.maxCharsForText(10)) {
 				ebitenutil.DebugPrintAt(screen, w, 10, cursorY)
@@ -613,18 +746,22 @@ func (a *App) Draw(screen *ebiten.Image) {
 				ebitenutil.DebugPrintAt(screen, "v", 2, baseY+(maxRows-1)*14)
 			}
 		case "settings":
-			title := "Settings (Use Up/Down to select; Left/Right to change; Enter/Esc to return)"
+			title := "Settings (Up/Down select; Left/Right change; Enter: edit/apply; Backspace/Esc: back)"
 			cursorY := 10
 			for _, w := range a.wrapText(title, a.maxCharsForText(10)) {
 				ebitenutil.DebugPrintAt(screen, w, 10, cursorY)
 				cursorY += 14
 			}
 			// items
+			romDir := a.cfg.ROMsDir
+			if a.editingROMDir {
+				romDir = a.romDirInput + "_"
+			}
 			items := []string{
 				fmt.Sprintf("Scale: %dx", a.cfg.Scale),
 				fmt.Sprintf("Audio: %s", map[bool]string{true: "Stereo", false: "Mono"}[a.cfg.AudioStereo]),
 				fmt.Sprintf("Audio Adaptive: %s", map[bool]string{true: "On", false: "Off"}[a.cfg.AudioAdaptive]),
-				fmt.Sprintf("ROMs Dir: %s", a.truncateText(a.cfg.ROMsDir, a.maxCharsForText(10)-11)),
+				fmt.Sprintf("ROMs Dir: %s", a.truncateText(romDir, a.maxCharsForText(10)-11)),
 			}
 			for i, it := range items {
 				prefix := "  "
@@ -688,9 +825,15 @@ func (a *App) findROMs() []string {
 
 // --- Settings persistence ---
 func settingsPath() string {
+	// Prefer user config dir (e.g., %AppData%/gbemu) for persistence
+	if dir, err := os.UserConfigDir(); err == nil {
+		d := filepath.Join(dir, "gbemu")
+		_ = os.MkdirAll(d, 0755)
+		return filepath.Join(d, "settings.json")
+	}
+	// Fallback to executable directory
 	exe, _ := os.Executable()
-	dir := filepath.Dir(exe)
-	return filepath.Join(dir, "gbemu_settings.json")
+	return filepath.Join(filepath.Dir(exe), "gbemu_settings.json")
 }
 
 func loadSettings(override Config) Config {
