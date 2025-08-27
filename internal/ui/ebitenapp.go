@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -59,9 +60,9 @@ type App struct {
 }
 
 func NewApp(cfg Config, m *emu.Machine) *App {
-	if cfg.Scale <= 0 {
-		cfg.Scale = 3
-	}
+	// Load settings from file if present, then apply defaults and merge
+	cfg = loadSettings(cfg)
+	cfg.Defaults()
 	ebiten.SetWindowTitle(cfg.Title)
 	ebiten.SetWindowSize(160*cfg.Scale, 144*cfg.Scale)
 	a := &App{cfg: cfg, m: m}
@@ -76,10 +77,22 @@ func NewApp(cfg Config, m *emu.Machine) *App {
 	a.targetFrames = (cfg.AudioBufferMs * 48000) / 1000
 	a.stableTicks = 0
 	// Defer creating the player until Update runs to ensure window init isn't blocked
+	// If no ROM is loaded yet, open the ROM picker automatically
+	if m != nil && m.ROMPath() == "" {
+		a.showMenu = true
+		a.menuMode = "rom"
+		a.menuIdx = 0
+		a.romList = a.findROMs()
+		a.romSel = 0
+		a.romOff = 0
+	}
 	return a
 }
 
 func (a *App) Run() error { return ebiten.RunGame(a) }
+
+// SaveSettings persists current settings to disk.
+func (a *App) SaveSettings() { a.saveSettings() }
 
 func (a *App) Update() error {
 	// Lazy-create audio player on first update to avoid startup blocking before the window appears
@@ -175,18 +188,10 @@ func (a *App) Update() error {
 			}
 			if inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
 				switch a.menuIdx {
-				case 0: // Save
-					if err := a.m.SaveStateToFile("slot0.savestate"); err == nil {
-						a.toast("Saved state to slot0.savestate")
-					} else {
-						a.toast("Save failed: " + err.Error())
-					}
-				case 1: // Load
-					if err := a.m.LoadStateFromFile("slot0.savestate"); err == nil {
-						a.toast("Loaded state from slot0.savestate")
-					} else {
-						a.toast("Load failed: " + err.Error())
-					}
+				case 0: // Save (slot 0)
+					if err := a.saveSlot(0); err == nil { a.toast("Saved slot 0") } else { a.toast("Save failed: "+err.Error()) }
+				case 1: // Load (slot 0)
+					if err := a.loadSlot(0); err == nil { a.toast("Loaded slot 0") } else { a.toast("Load failed: "+err.Error()) }
 				case 2: // Switch ROM
 					a.romList = a.findROMs()
 					a.romSel = 0
@@ -239,6 +244,13 @@ func (a *App) Update() error {
 					path := a.romList[a.romSel]
 					if err := a.m.LoadROMFromFile(path); err == nil {
 						a.toast("Loaded ROM: " + filepath.Base(path))
+						// Try to load battery save next to ROM
+						if strings.HasSuffix(strings.ToLower(path), ".gb") {
+							sav := strings.TrimSuffix(path, ".gb") + ".sav"
+							if data, err := os.ReadFile(sav); err == nil {
+								_ = a.m.LoadBattery(data)
+							}
+						}
 					} else {
 						a.toast("ROM load failed: " + err.Error())
 					}
@@ -604,6 +616,7 @@ func (a *App) Draw(screen *ebiten.Image) {
 				fmt.Sprintf("Scale: %dx", a.cfg.Scale),
 				fmt.Sprintf("Audio: %s", map[bool]string{true: "Stereo", false: "Mono"}[a.cfg.AudioStereo]),
 				fmt.Sprintf("Audio Adaptive: %s", map[bool]string{true: "On", false: "Off"}[a.cfg.AudioAdaptive]),
+				fmt.Sprintf("ROMs Dir: %s", a.truncateText(a.cfg.ROMsDir, a.maxCharsForText(10)-11)),
 			}
 			for i, it := range items {
 				prefix := "  "
@@ -642,7 +655,14 @@ func (a *App) findROMs() []string {
 			}
 		}
 	}
-	addFrom("testroms")
+	// Resolve ROMsDir relative to the executable directory
+	exe, _ := os.Executable()
+	exedir := filepath.Dir(exe)
+	roms := a.cfg.ROMsDir
+	if !filepath.IsAbs(roms) {
+		roms = filepath.Join(exedir, roms)
+	}
+	addFrom(roms)
 	addFrom(".")
 	sort.Strings(files)
 	// de-dup
@@ -656,6 +676,57 @@ func (a *App) findROMs() []string {
 		uniq = append(uniq, p)
 	}
 	return uniq
+}
+
+// --- Settings persistence ---
+func settingsPath() string {
+	exe, _ := os.Executable()
+	dir := filepath.Dir(exe)
+	return filepath.Join(dir, "gbemu_settings.json")
+}
+
+func loadSettings(override Config) Config {
+	var cfg Config
+	if b, err := os.ReadFile(settingsPath()); err == nil {
+		_ = json.Unmarshal(b, &cfg)
+	}
+	// override non-zero fields from param
+	if override.Title != "" { cfg.Title = override.Title }
+	if override.Scale != 0 { cfg.Scale = override.Scale }
+	if override.AudioBufferMs != 0 { cfg.AudioBufferMs = override.AudioBufferMs }
+	if override.ROMsDir != "" { cfg.ROMsDir = override.ROMsDir }
+	cfg.AudioStereo = override.AudioStereo || cfg.AudioStereo
+	cfg.AudioAdaptive = override.AudioAdaptive || cfg.AudioAdaptive
+	if cfg.Title == "" && override.Title == "" { cfg.Title = "gbemu" }
+	return cfg
+}
+
+func (a *App) saveSettings() {
+	if a == nil { return }
+	b, _ := json.MarshalIndent(a.cfg, "", "  ")
+	_ = os.WriteFile(settingsPath(), b, 0644)
+}
+
+// --- Save states (per-ROM, per-slot) ---
+func (a *App) statePath(slot int) string {
+	// State file: <ROMName>.slot<slot>.savestate in same dir as ROM
+	base := "unknown"
+	if a.m != nil && a.m.ROMPath() != "" {
+		base = a.m.ROMPath()
+	}
+	dir := filepath.Dir(base)
+	name := filepath.Base(base)
+	return filepath.Join(dir, fmt.Sprintf("%s.slot%d.savestate", name, slot))
+}
+
+func (a *App) saveSlot(slot int) error {
+	path := a.statePath(slot)
+	return a.m.SaveStateToFile(path)
+}
+
+func (a *App) loadSlot(slot int) error {
+	path := a.statePath(slot)
+	return a.m.LoadStateFromFile(path)
 }
 
 func (a *App) Layout(outW, outH int) (int, int) { return 160, 144 }

@@ -113,7 +113,10 @@ func mustRead(path string) []byte {
 
 func main() {
 	f := parseFlags()
-	rom := mustRead(f.ROMPath)
+	var rom []byte
+	if f.ROMPath != "" {
+		rom = mustRead(f.ROMPath)
+	}
 	boot := mustRead(f.BootROM)
 
 	if len(rom) >= 0x150 {
@@ -127,8 +130,13 @@ func main() {
 		LimitFPS: false, // headless wants max speed
 	}
 	m := emu.New(emuCfg)
-	if err := m.LoadCartridge(rom, boot); err != nil {
-		log.Fatalf("load cart: %v", err)
+	if len(boot) >= 0x100 {
+		m.SetBootROM(boot)
+	}
+	if len(rom) > 0 {
+		if err := m.LoadCartridge(rom, boot); err != nil {
+			log.Fatalf("load cart: %v", err)
+		}
 	}
 
 	// Battery RAM: load .sav if present
@@ -161,11 +169,22 @@ func main() {
 	if err := app.Run(); err != nil {
 		log.Fatal(err)
 	}
-	// UI exit: save battery RAM if enabled
-	if f.SaveRAM && savPath != "" {
-		if data, ok := m.SaveBattery(); ok {
-			if err := os.WriteFile(savPath, data, 0644); err == nil {
-				log.Printf("wrote %s", savPath)
+	// Persist settings after UI exit
+	// Best-effort: ignore errors
+	if s, ok := any(app).(interface{ SaveSettings() }); ok {
+		s.SaveSettings()
+	}
+	// UI exit: save battery RAM if enabled (derive path from current ROM if needed)
+	if f.SaveRAM {
+		outSav := savPath
+		if outSav == "" && m.ROMPath() != "" && strings.HasSuffix(strings.ToLower(m.ROMPath()), ".gb") {
+			outSav = strings.TrimSuffix(m.ROMPath(), ".gb") + ".sav"
+		}
+		if outSav != "" {
+			if data, ok := m.SaveBattery(); ok {
+				if err := os.WriteFile(outSav, data, 0644); err == nil {
+					log.Printf("wrote %s", outSav)
+				}
 			}
 		}
 	}
