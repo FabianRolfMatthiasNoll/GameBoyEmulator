@@ -11,12 +11,13 @@ import (
 	"strings"
 	"time"
 
+	"encoding/binary"
+
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/emu"
 	"github.com/hajimehoshi/ebiten/v2"
+	"github.com/hajimehoshi/ebiten/v2/audio"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
-	"github.com/hajimehoshi/ebiten/v2/audio"
-	"encoding/binary"
 )
 
 type App struct {
@@ -280,10 +281,12 @@ func (a *App) Update() error {
 
 // apuStream implements io.Reader by pulling PCM samples from the emulator APU and
 // converting them to 16-bit little-endian stereo frames.
-type apuStream struct { m *emu.Machine }
+type apuStream struct{ m *emu.Machine }
 
 func (s *apuStream) Read(p []byte) (int, error) {
-	if len(p) == 0 || s == nil || s.m == nil { return 0, nil }
+	if len(p) == 0 || s == nil || s.m == nil {
+		return 0, nil
+	}
 	// Each sample is 4 bytes (stereo int16). Fill the entire buffer.
 	want := len(p) / 4
 	samples := s.m.APUPullSamples(want)
@@ -296,7 +299,10 @@ func (s *apuStream) Read(p []byte) (int, error) {
 	}
 	// Fill remaining with silence
 	for i < len(p) {
-		p[i+0] = 0; p[i+1] = 0; p[i+2] = 0; p[i+3] = 0
+		p[i+0] = 0
+		p[i+1] = 0
+		p[i+2] = 0
+		p[i+3] = 0
 		i += 4
 	}
 	return len(p), nil

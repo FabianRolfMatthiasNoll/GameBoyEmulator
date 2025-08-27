@@ -7,8 +7,8 @@ import (
 	"io"
 	"os"
 
-	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/cart"
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/apu"
+	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/cart"
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/ppu"
 )
 
@@ -189,9 +189,12 @@ func (b *Bus) Read(addr uint16) byte {
 		addr == 0xFF4A, addr == 0xFF4B:
 		return b.ppu.CPURead(addr)
 	// APU registers (subset): NR21..NR24, NR50..NR52
-	case addr >= 0xFF16 && addr <= 0xFF19,
+	case addr >= 0xFF10 && addr <= 0xFF14,
+		addr >= 0xFF16 && addr <= 0xFF19,
 		addr == 0xFF24, addr == 0xFF25, addr == 0xFF26:
-		if b.apu != nil { return b.apu.CPURead(addr) }
+		if b.apu != nil {
+			return b.apu.CPURead(addr)
+		}
 		return 0xFF
 	case addr == 0xFF46:
 		return b.dma
@@ -318,9 +321,12 @@ func (b *Bus) Write(addr uint16, value byte) {
 		b.ppu.CPUWrite(addr, value)
 		return
 	// APU registers
-	case addr >= 0xFF16 && addr <= 0xFF19,
+	case addr >= 0xFF10 && addr <= 0xFF14,
+		addr >= 0xFF16 && addr <= 0xFF19,
 		addr == 0xFF24, addr == 0xFF25, addr == 0xFF26:
-		if b.apu != nil { b.apu.CPUWrite(addr, value) }
+		if b.apu != nil {
+			b.apu.CPUWrite(addr, value)
+		}
 		return
 	case addr == 0xFF46:
 		// OAM DMA: initiate 160-byte transfer from value*0x100 to FE00, 1 byte per cycle
