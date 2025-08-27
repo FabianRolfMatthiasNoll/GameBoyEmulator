@@ -3,6 +3,7 @@ package apu
 import (
 	"bytes"
 	"encoding/gob"
+	"sync"
 )
 
 // CPU frequency in Hz (DMG)
@@ -33,6 +34,9 @@ type APU struct {
 	sR    []int16
 	sHead int
 	sTail int
+
+	// guard for ring buffer operations accessed from multiple goroutines
+	mu sync.Mutex
 
 	// Mixing registers (not fully used yet)
 	nr50 byte // 0xFF24
@@ -117,11 +121,11 @@ func New(sampleRate int) *APU {
 		enabled:         true,
 		sampleRate:      sampleRate,
 		cyclesPerSample: float64(cpuHz) / float64(sampleRate),
-		mixGain:         0.20, // a bit more headroom to reduce clipping
+		mixGain:         0.24, // slightly higher with soft limiter
 		fsCounter:       cpuHz / 512,
-		buf:             make([]int16, 16384),
-		sL:              make([]int16, 16384),
-		sR:              make([]int16, 16384),
+		buf:             make([]int16, 65536),
+		sL:              make([]int16, 65536),
+		sR:              make([]int16, 65536),
 	}
 	// Sensible stereo defaults: route all channels to both and set max master volume.
 	a.nr50 = 0x77
@@ -799,36 +803,55 @@ func (a *APU) mixSampleStereo() (int16, int16) {
 	lv := float64((a.nr50>>4)&0x07) / 7.0
 	l *= lv
 	r *= rv
-	// Apply overall gain and clamp
-	l *= a.mixGain
-	r *= a.mixGain
-	if l > 1 {
-		l = 1
-	} else if l < -1 {
-		l = -1
-	}
-	if r > 1 {
-		r = 1
-	} else if r < -1 {
-		r = -1
-	}
+	// Apply overall gain then a soft limiter to tame peaks without harsh clipping
+	l = softLimit(l * a.mixGain)
+	r = softLimit(r * a.mixGain)
 	return int16(l * 32767), int16(r * 32767)
+}
+
+// softLimit provides gentle saturation near [-1,1] to reduce audible clipping.
+// Using a tanh-like approximation for speed and stability: x / (1 + k|x|), k~0.5
+func softLimit(x float64) float64 {
+	k := 0.5
+	y := x / (1.0 + k*absf(x))
+	if y > 1 {
+		y = 1
+	}
+	if y < -1 {
+		y = -1
+	}
+	return y
+}
+
+func absf(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 // pushStereo pushes a stereo frame to the ring buffers.
 func (a *APU) pushStereo(l, r int16) {
+	a.mu.Lock()
 	next := (a.sHead + 1) & (len(a.sL) - 1)
 	if next == a.sTail {
+		a.mu.Unlock()
 		return // drop if full
 	}
 	a.sL[a.sHead] = l
 	a.sR[a.sHead] = r
 	a.sHead = next
+	a.mu.Unlock()
 }
 
 // PullStereo returns up to max stereo frames as an interleaved int16 slice [L0,R0,L1,R1,...].
 func (a *APU) PullStereo(max int) []int16 {
-	if max <= 0 || a.sHead == a.sTail {
+	if max <= 0 {
+		return nil
+	}
+	a.mu.Lock()
+	if a.sHead == a.sTail {
+		a.mu.Unlock()
 		return nil
 	}
 	// Limit by available frames
@@ -841,11 +864,14 @@ func (a *APU) PullStereo(max int) []int16 {
 		out = append(out, a.sL[a.sTail], a.sR[a.sTail])
 		a.sTail = (a.sTail + 1) & (len(a.sL) - 1)
 	}
+	a.mu.Unlock()
 	return out
 }
 
 // StereoAvailable returns the number of stereo frames currently buffered.
 func (a *APU) StereoAvailable() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.sHead == a.sTail {
 		return 0
 	}
@@ -856,18 +882,26 @@ func (a *APU) StereoAvailable() int {
 }
 
 func (a *APU) pushSample(s int16) {
+	a.mu.Lock()
 	next := (a.bufHead + 1) & (len(a.buf) - 1)
 	if next == a.bufTail {
 		// buffer full, drop sample
+		a.mu.Unlock()
 		return
 	}
 	a.buf[a.bufHead] = s
 	a.bufHead = next
+	a.mu.Unlock()
 }
 
 // PullSamples copies up to max samples out of the ring buffer.
 func (a *APU) PullSamples(max int) []int16 {
-	if max <= 0 || a.bufHead == a.bufTail {
+	if max <= 0 {
+		return nil
+	}
+	a.mu.Lock()
+	if a.bufHead == a.bufTail {
+		a.mu.Unlock()
 		return nil
 	}
 	out := make([]int16, 0, max)
@@ -875,6 +909,7 @@ func (a *APU) PullSamples(max int) []int16 {
 		out = append(out, a.buf[a.bufTail])
 		a.bufTail = (a.bufTail + 1) & (len(a.buf) - 1)
 	}
+	a.mu.Unlock()
 	return out
 }
 

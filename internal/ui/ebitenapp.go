@@ -26,15 +26,24 @@ type App struct {
 	tex    *ebiten.Image
 	paused bool
 	fast   bool
+	// timing
+	lastTime   time.Time
+	frameAcc   float64 // accumulated fractional frames
+	audioMuted bool
 
 	// audio
 	audioCtx    *audio.Context
 	audioPlayer *audio.Player
+	audioSrc    *apuStream // for stats overlay
 
 	// overlay/menu
-	showMenu bool
-	menuIdx  int    // selection index for current menu
-	menuMode string // "main" | "rom" | "keys" | "settings"
+	showMenu  bool
+	menuIdx   int    // selection index for current menu
+	menuMode  string // "main" | "rom" | "keys" | "settings"
+	showStats bool   // debug: show audio buffer stats
+	// adaptive audio buffering
+	targetFrames int // desired stereo frames in buffer
+	stableTicks  int // ticks since last underrun
 
 	// rom picker state
 	romList []string
@@ -56,19 +65,35 @@ func NewApp(cfg Config, m *emu.Machine) *App {
 	ebiten.SetWindowTitle(cfg.Title)
 	ebiten.SetWindowSize(160*cfg.Scale, 144*cfg.Scale)
 	a := &App{cfg: cfg, m: m}
+	a.lastTime = time.Now()
+	a.frameAcc = 0
 	// Init audio at 48kHz to match APU
 	a.audioCtx = audio.NewContext(48000)
-	// Create a streaming player that pulls from the emulator APU
-	if p, err := a.audioCtx.NewPlayer(&apuStream{m: m}); err == nil {
-		a.audioPlayer = p
-		a.audioPlayer.Play()
+	// Configure adaptive buffering and initial target
+	if cfg.AudioBufferMs <= 0 {
+		cfg.AudioBufferMs = 125
 	}
+	a.targetFrames = (cfg.AudioBufferMs * 48000) / 1000
+	a.stableTicks = 0
+	// Defer creating the player until Update runs to ensure window init isn't blocked
 	return a
 }
 
 func (a *App) Run() error { return ebiten.RunGame(a) }
 
 func (a *App) Update() error {
+	// Lazy-create audio player on first update to avoid startup blocking before the window appears
+	if a.audioPlayer == nil {
+		// Prefill a bit to prevent initial underruns BEFORE starting the player
+		for i := 0; i < 12; i++ {
+			a.m.StepFrame()
+		}
+		a.audioSrc = &apuStream{m: a.m, mono: !a.cfg.AudioStereo, muted: &a.audioMuted}
+		if p, err := a.audioCtx.NewPlayer(a.audioSrc); err == nil {
+			a.audioPlayer = p
+			a.audioPlayer.Play()
+		}
+	}
 	// Keyboard → Game Boy buttons (disabled when menu is shown)
 	if !a.showMenu {
 		var btn emu.Buttons
@@ -129,6 +154,13 @@ func (a *App) Update() error {
 			a.menuMode = "main"
 			a.menuIdx = 0
 		}
+	}
+	// Apply mute when paused or menu shown; reset pacing on transitions
+	muted := a.paused || a.showMenu
+	if muted != a.audioMuted {
+		a.audioMuted = muted
+		a.lastTime = time.Now()
+		a.frameAcc = 0
 	}
 	if a.showMenu {
 		switch a.menuMode {
@@ -230,8 +262,8 @@ func (a *App) Update() error {
 			}
 		case "settings":
 			// Select a setting with Up/Down; change with Left/Right.
-			// Only one setting for now: Scale.
-			items := 1
+			// Items: Scale, Audio Output, Audio Adaptive
+			items := 3
 			if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) && a.menuIdx > 0 {
 				a.menuIdx--
 			}
@@ -251,6 +283,29 @@ func (a *App) Update() error {
 						ebiten.SetWindowSize(160*a.cfg.Scale, 144*a.cfg.Scale)
 					}
 				}
+			} else if a.menuIdx == 1 { // Audio Output
+				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) {
+					a.cfg.AudioStereo = !a.cfg.AudioStereo
+					// Recreate player with new mono/stereo mode
+					if a.audioPlayer != nil {
+						a.audioPlayer.Close()
+						a.audioPlayer = nil
+					}
+					// Prefill some frames by stepping emulation to reduce initial underruns
+					for i := 0; i < 12; i++ {
+						a.m.StepFrame()
+					}
+					// Create a streaming player that pulls from the emulator APU (after prefill)
+					a.audioSrc = &apuStream{m: a.m, mono: !a.cfg.AudioStereo, muted: &a.audioMuted}
+					if p, err := a.audioCtx.NewPlayer(a.audioSrc); err == nil {
+						a.audioPlayer = p
+						a.audioPlayer.Play()
+					}
+				} else if a.menuIdx == 2 { // Audio Adaptive
+					if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) {
+						a.cfg.AudioAdaptive = !a.cfg.AudioAdaptive
+					}
+				}
 			}
 			if inpututil.IsKeyJustPressed(ebiten.KeyEnter) || inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
 				a.menuMode = "main"
@@ -262,15 +317,62 @@ func (a *App) Update() error {
 	if inpututil.IsKeyJustPressed(ebiten.KeyF12) {
 		_ = a.saveScreenshot()
 	}
+	// Toggle stats overlay (F8)
+	if inpututil.IsKeyJustPressed(ebiten.KeyF8) {
+		a.showStats = !a.showStats
+	}
 
-	// Freeze emulation while menu is open
-	if !a.showMenu {
-		if !a.paused {
-			if a.fast {
-				for i := 0; i < 5; i++ {
-					a.m.StepFrame()
+	// Emulation pacing: run at ~59.7275 FPS using a time accumulator, decoupled from Ebiten's ~60Hz
+	if !a.showMenu && !a.paused {
+		now := time.Now()
+		dt := now.Sub(a.lastTime).Seconds()
+		if dt < 0 {
+			dt = 0
+		}
+		a.lastTime = now
+		gbFps := 4194304.0 / 70224.0 // ~59.7275
+		speed := 1.0
+		if a.fast {
+			speed = 5.0
+		}
+		a.frameAcc += dt * gbFps * speed
+		// Step whole frames
+		steps := 0
+		for a.frameAcc >= 1.0 && steps < 10 { // cap to avoid spiral of death
+			a.m.StepFrame()
+			a.frameAcc -= 1.0
+			steps++
+		}
+		// Adaptive audio buffer target: raise on underruns, decay slowly when stable
+		if a.cfg.AudioAdaptive && a.audioSrc != nil {
+			if a.audioSrc.underruns > 0 {
+				a.stableTicks = 0
+				if a.targetFrames < 10500 {
+					a.targetFrames += 600
 				}
+				a.audioSrc.underruns = 0
 			} else {
+				a.stableTicks++
+				if a.stableTicks > 120 {
+					if a.targetFrames > 5400 {
+						a.targetFrames -= 300
+					}
+					a.stableTicks = 0
+				}
+			}
+		}
+		// Audio buffer top-up toward current target
+		target := a.targetFrames
+		buffered := a.m.APUBufferedStereo()
+		if buffered < target {
+			deficit := target - buffered
+			// ~samples per GB frame at 48kHz: ~803
+			const spf = 803
+			framesNeeded := (deficit + spf - 1) / spf
+			if framesNeeded > 8 {
+				framesNeeded = 8
+			} // small cap per tick
+			for i := 0; i < framesNeeded; i++ {
 				a.m.StepFrame()
 			}
 		}
@@ -281,48 +383,81 @@ func (a *App) Update() error {
 
 // apuStream implements io.Reader by pulling PCM samples from the emulator APU and
 // converting them to 16-bit little-endian stereo frames.
-type apuStream struct{ m *emu.Machine }
+type apuStream struct {
+	m     *emu.Machine
+	mono  bool
+	muted *bool
+	// stats
+	underruns  int
+	lastWant   int
+	lastPulled int
+}
 
 func (s *apuStream) Read(p []byte) (int, error) {
 	if len(p) == 0 || s == nil || s.m == nil {
 		return 0, nil
 	}
-	// Each frame is 4 bytes (stereo int16). Try to fill entire buffer; avoid output underruns.
+	// If buffer is smaller than a full stereo frame (4 bytes), fill with silence to avoid returning 0 bytes.
+	if len(p) < 4 {
+		for i := range p {
+			p[i] = 0
+		}
+		return len(p), nil
+	}
+	if s.muted != nil && *s.muted {
+		for i := range p {
+			p[i] = 0
+		}
+		time.Sleep(5 * time.Millisecond)
+		return len(p), nil
+	}
+	// Each frame is 4 bytes (stereo int16). Block until the buffer is filled.
 	want := len(p) / 4
 	filled := 0
-	// Keep a simple last-sample for graceful underflows
-	var last int16
+	// Short, responsive wait loop: return what we have instead of padding
+	deadline := time.Now().Add(15 * time.Millisecond)
 	for filled < want {
 		frames := s.m.APUPullStereo(want - filled)
-		// Convert pulled frames (interleaved) to mono and write both channels
+		if len(frames) == 0 {
+			if time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(1 * time.Millisecond)
+			continue
+		}
+		// Convert pulled frames (interleaved) depending on mode
 		i := filled * 4
 		for j := 0; j+1 < len(frames) && i+3 < len(p); j += 2 {
-			l := int32(frames[j])
-			r := int32(frames[j+1])
-			m := int16((l + r) / 2)
-			last = m
-			binary.LittleEndian.PutUint16(p[i:], uint16(m))
-			binary.LittleEndian.PutUint16(p[i+2:], uint16(m))
+			l := int16(frames[j])
+			r := int16(frames[j+1])
+			if s.mono {
+				m := int16((int32(l) + int32(r)) / 2)
+				binary.LittleEndian.PutUint16(p[i:], uint16(m))
+				binary.LittleEndian.PutUint16(p[i+2:], uint16(m))
+			} else {
+				binary.LittleEndian.PutUint16(p[i:], uint16(l))
+				binary.LittleEndian.PutUint16(p[i+2:], uint16(r))
+			}
 			i += 4
 			filled++
 		}
-		if filled >= want {
-			break
-		}
-		// If not enough frames available yet, fill a tiny chunk with last to prevent hard gaps.
-		// This smooths over jitter without adding latency.
-		padFrames := want - filled
-		if padFrames > 8 {
-			padFrames = 8
-		}
-		for k := 0; k < padFrames; k++ {
-			idx := (filled + k) * 4
-			binary.LittleEndian.PutUint16(p[idx:], uint16(last))
-			binary.LittleEndian.PutUint16(p[idx+2:], uint16(last))
-		}
-		filled += padFrames
 	}
-	return filled * 4, nil
+	if filled < want {
+		s.underruns++
+		// pad remaining with silence to avoid stalling
+		i := filled * 4
+		for ; filled < want && i+3 < len(p); filled++ {
+			binary.LittleEndian.PutUint16(p[i:], 0)
+			binary.LittleEndian.PutUint16(p[i+2:], 0)
+			i += 4
+		}
+		s.lastWant = want
+		s.lastPulled = filled
+		return want * 4, nil
+	}
+	s.lastWant = want
+	s.lastPulled = filled
+	return want * 4, nil
 }
 
 func (a *App) Draw(screen *ebiten.Image) {
@@ -331,6 +466,20 @@ func (a *App) Draw(screen *ebiten.Image) {
 	}
 	a.tex.WritePixels(a.m.Framebuffer())
 	screen.DrawImage(a.tex, nil)
+
+	// Stats overlay
+	if a.showStats {
+		bf := a.m.APUBufferedStereo()
+		ms := (bf * 1000) / 48000 // ~ms of audio buffered at 48kHz
+		und, lp, lw := 0, 0, 0
+		if a.audioSrc != nil {
+			und = a.audioSrc.underruns
+			lp = a.audioSrc.lastPulled
+			lw = a.audioSrc.lastWant
+		}
+		ebitenutil.DebugPrintAt(screen, fmt.Sprintf("Buf: %d (~%dms)", bf, ms), 4, 4)
+		ebitenutil.DebugPrintAt(screen, fmt.Sprintf("Under: %d  Read: %d/%d", und, lp, lw), 4, 18)
+	}
 
 	// Toast message
 	if a.toastMsg != "" && time.Now().Before(a.toastUntil) {
@@ -453,6 +602,8 @@ func (a *App) Draw(screen *ebiten.Image) {
 			// items
 			items := []string{
 				fmt.Sprintf("Scale: %dx", a.cfg.Scale),
+				fmt.Sprintf("Audio: %s", map[bool]string{true: "Stereo", false: "Mono"}[a.cfg.AudioStereo]),
+				fmt.Sprintf("Audio Adaptive: %s", map[bool]string{true: "On", false: "Off"}[a.cfg.AudioAdaptive]),
 			}
 			for i, it := range items {
 				prefix := "  "
