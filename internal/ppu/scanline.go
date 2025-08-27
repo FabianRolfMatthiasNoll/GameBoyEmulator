@@ -46,3 +46,36 @@ func RenderBGScanlineUsingFetcher(mem VRAMReader, mapBase uint16, tileData8000 b
 	}
 	return out
 }
+
+// RenderWindowScanlineUsingFetcher renders the window layer for a scanline using the fetcher.
+// It fills pixels starting at wxStart (WX-7) using winLine as the vertical line within the window.
+// Pixels before wxStart are left as 0 (BG color index 0) so callers can blend.
+func RenderWindowScanlineUsingFetcher(mem VRAMReader, mapBase uint16, tileData8000 bool, wxStart int, winLine byte) [160]byte {
+	var out [160]byte
+	if wxStart >= 160 {
+		return out
+	}
+	if wxStart < 0 {
+		wxStart = 0
+	}
+	// Compute window tile row and fineY
+	mapY := (uint16(winLine) >> 3) & 31
+	fineY := winLine & 7
+	tileX := uint16(0)
+	tileIndexAddr := mapBase + mapY*32 + tileX
+	var q fifo
+	f := newBGFetcher(mem, &q)
+	f.Configure(mapBase, tileData8000, tileIndexAddr, fineY)
+	f.Fetch()
+	for x := wxStart; x < 160; x++ {
+		if q.Len() == 0 {
+			tileX = (tileX + 1) & 31
+			tileIndexAddr = mapBase + mapY*32 + tileX
+			f.Configure(mapBase, tileData8000, tileIndexAddr, fineY)
+			f.Fetch()
+		}
+		px, _ := q.Pop()
+		out[x] = px
+	}
+	return out
+}

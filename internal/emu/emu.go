@@ -470,6 +470,60 @@ func (m *Machine) renderWindow() {
 	if m.bus == nil {
 		return
 	}
+	// Optional fetcher-based window rendering
+	if m.cfg.UseFetcherBG {
+		for y := 0; y < 144; y++ {
+			lr := m.bus.PPU().LineRegs(y)
+			if lr.LCDC == 0 {
+				lr.LCDC = m.bus.Read(0xFF40)
+				lr.WY = m.bus.Read(0xFF4A)
+				lr.WX = m.bus.Read(0xFF4B)
+				lr.BGP = m.bus.Read(0xFF47)
+			}
+			if (lr.LCDC&0x80) == 0 || (lr.LCDC&0x01) == 0 || (lr.LCDC&0x20) == 0 {
+				continue
+			}
+			if y < int(lr.WY) || int(lr.WY) >= 144 {
+				continue
+			}
+			winXStart := int(lr.WX) - 7
+			if winXStart >= 160 {
+				continue
+			}
+			winMapBase := uint16(0x9800)
+			if (lr.LCDC & 0x40) != 0 {
+				winMapBase = 0x9C00
+			}
+			tileData8000 := (lr.LCDC & 0x10) != 0
+			// Drive window scanline via fetcher
+			vr := vramReaderAdapter{ppu: m.bus.PPU()}
+			line := ppu.RenderWindowScanlineUsingFetcher(vr, winMapBase, tileData8000, winXStart, lr.WinLine)
+			// Shade and blend onto framebuffer starting at winXStart
+			bgp := lr.BGP
+			shade := func(ci byte) byte {
+				shift := ci * 2
+				pal := (bgp >> shift) & 0x03
+				switch pal {
+				case 0:
+					return 0xFF
+				case 1:
+					return 0xC0
+				case 2:
+					return 0x60
+				default:
+					return 0x00
+				}
+			}
+			for x := max(0, winXStart); x < 160; x++ {
+				ci := line[x]
+				s := shade(ci)
+				i := (y*m.w + x) * 4
+				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = s, s, s, 0xFF
+				m.bgci[y*m.w+x] = ci
+			}
+		}
+		return
+	}
 	// Render per-line using snapshots; do not early-return based on live regs to preserve mid-frame changes
 	for y := 0; y < 144; y++ {
 		// Snapshot this line
