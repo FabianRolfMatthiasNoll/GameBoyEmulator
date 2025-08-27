@@ -74,3 +74,57 @@ func TestScanlineFetcherSCYRowSelectAndMapWrap(t *testing.T) {
 		}
 	}
 }
+
+func TestScanlineFetcherMapBase9C00(t *testing.T) {
+	mapBase := uint16(0x9C00)
+	mem := mockVRAM{}
+	// first tiles 2,3
+	mem[mapBase+0] = 2
+	mem[mapBase+1] = 3
+	fineY := byte(0)
+	base2 := uint16(0x8000+2*16) + uint16(fineY)*2
+	mem[base2] = 0x3C
+	mem[base2+1] = 0xA0
+	base3 := uint16(0x8000+3*16) + uint16(fineY)*2
+	mem[base3] = 0x0F
+	mem[base3+1] = 0xF0
+	out := RenderBGScanlineUsingFetcher(mem, mapBase, true, 0, 0, 0)
+	// First 8 from tile2
+	lo, hi := byte(0x3C), byte(0xA0)
+	for i := 0; i < 8; i++ {
+		b := 7 - byte(i)
+		want := ((hi>>b)&1)<<1 | ((lo >> b) & 1)
+		if out[i] != want {
+			t.Fatalf("tile2 px %d got %d want %d", i, out[i], want)
+		}
+	}
+	// Next 8 from tile3
+	lo, hi = 0x0F, 0xF0
+	for i := 0; i < 8; i++ {
+		b := 7 - byte(i)
+		want := ((hi>>b)&1)<<1 | ((lo >> b) & 1)
+		if out[8+i] != want {
+			t.Fatalf("tile3 px %d got %d want %d", i, out[8+i], want)
+		}
+	}
+}
+
+func TestScanlineFetcherSignedTileData8800(t *testing.T) {
+	mapBase := uint16(0x9800)
+	mem := mockVRAM{}
+	// tile index -1 (0xFF) at first column
+	mem[mapBase+0] = 0xFF
+	// For 0x8800 addressing with tile=-1: base row at 0x8FF0
+	rowAddr := uint16(0x8FF0)
+	mem[rowAddr] = 0xC3
+	mem[rowAddr+1] = 0x18
+	out := RenderBGScanlineUsingFetcher(mem, mapBase, false, 0, 0, 0)
+	lo, hi := byte(0xC3), byte(0x18)
+	for i := 0; i < 8; i++ {
+		b := 7 - byte(i)
+		want := ((hi>>b)&1)<<1 | ((lo >> b) & 1)
+		if out[i] != want {
+			t.Fatalf("signed tile px %d got %d want %d", i, out[i], want)
+		}
+	}
+}

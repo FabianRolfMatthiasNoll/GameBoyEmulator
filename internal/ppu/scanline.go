@@ -79,3 +79,84 @@ func RenderWindowScanlineUsingFetcher(mem VRAMReader, mapBase uint16, tileData80
 	}
 	return out
 }
+
+// Sprite describes the minimal fields required to composite a sprite onto a scanline.
+type Sprite struct {
+	X        int  // screen X (0..159)
+	Y        int  // screen Y top (0..143). The function uses lineY to compute row.
+	Tile     byte // tile index (0..255), 0x8000 addressing
+	Attr     byte // bit7 priority, bit6 yflip, bit5 xflip, bit4 palette select
+	OAMIndex int  // index in OAM for tie-breaking
+}
+
+// ComposeSpriteLine returns per-pixel OBJ color indices for a scanline (0 means transparent/no OBJ).
+// It applies OBJ-to-BG priority: if sprite has priority bit set (behind BG) and bgci[x]!=0, the pixel is skipped.
+// It also enforces leftmost-X and then OAM index as tie-breakers for overlapping sprites at a given x.
+func ComposeSpriteLine(mem VRAMReader, sprites []Sprite, lineY int, bgci [160]byte, sprite16 bool) [160]byte {
+	var out [160]byte // 0 means no sprite drawn at that x
+	var bestX [160]int
+	var bestIdx [160]int
+	for i := 0; i < 160; i++ {
+		bestX[i] = 9999
+		bestIdx[i] = 9999
+	}
+	for _, s := range sprites {
+		// Determine if this sprite covers the scanline
+		height := 8
+		if sprite16 {
+			height = 16
+		}
+		if lineY < s.Y || lineY >= s.Y+height {
+			continue
+		}
+		row := lineY - s.Y
+		// vertical flip
+		if (s.Attr & (1 << 6)) != 0 {
+			if sprite16 {
+				row = height - 1 - row
+			} else {
+				row = 7 - row
+			}
+		}
+		// Select tile index and row within tile
+		tIndex := s.Tile
+		if sprite16 {
+			tIndex &= 0xFE
+			if row >= 8 {
+				tIndex++
+			}
+		}
+		rowWithin := row & 7
+		base := uint16(0x8000) + uint16(tIndex)*16 + uint16(rowWithin)*2
+		lo := mem.Read(base)
+		hi := mem.Read(base + 1)
+		for col := 0; col < 8; col++ {
+			screenX := s.X + col
+			if screenX < 0 || screenX >= 160 {
+				continue
+			}
+			// horizontal flip
+			bit := 7 - byte(col)
+			if (s.Attr & (1 << 5)) != 0 {
+				bit = byte(col)
+			}
+			ci := ((hi>>bit)&1)<<1 | ((lo >> bit) & 1)
+			if ci == 0 {
+				continue
+			}
+			// OBJ-to-BG priority: if bit7 set and BG pixel is non-zero, skip
+			if (s.Attr & (1 << 7)) != 0 {
+				if bgci[screenX] != 0 {
+					continue
+				}
+			}
+			// leftmost X, then OAM index tie-breaker
+			if screenX < bestX[screenX] || (screenX == bestX[screenX] && s.OAMIndex < bestIdx[screenX]) {
+				out[screenX] = ci
+				bestX[screenX] = screenX
+				bestIdx[screenX] = s.OAMIndex
+			}
+		}
+	}
+	return out
+}

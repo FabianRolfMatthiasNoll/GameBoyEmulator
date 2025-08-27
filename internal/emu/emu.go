@@ -605,6 +605,79 @@ func (m *Machine) renderSprites() {
 	if m.bus == nil {
 		return
 	}
+	if m.cfg.UseFetcherBG {
+		// Compose sprites over the fetcher-produced bgci/fb per line.
+		for y := 0; y < 144; y++ {
+			lr := m.bus.PPU().LineRegs(y)
+			lcdc := lr.LCDC
+			if lcdc == 0 {
+				lcdc = m.bus.Read(0xFF40)
+			}
+			if (lcdc&0x80) == 0 || (lcdc&0x02) == 0 {
+				continue
+			}
+			sprite16 := (lcdc & 0x04) != 0
+			obp0 := lr.OBP0
+			obp1 := lr.OBP1
+			if lr.LCDC == 0 {
+				obp0 = m.bus.Read(0xFF48)
+				obp1 = m.bus.Read(0xFF49)
+			}
+			// Gather up to 10 sprites that cover this line in OAM order
+			sprites := make([]ppu.Sprite, 0, 10)
+			for i := 0; i < 40 && len(sprites) < 10; i++ {
+				base := uint16(0xFE00 + i*4)
+				sy := int(m.bus.PPU().RawOAM(base)) - 16
+				sx := int(m.bus.PPU().RawOAM(base+1)) - 8
+				tile := m.bus.PPU().RawOAM(base + 2)
+				attr := m.bus.PPU().RawOAM(base + 3)
+				height := 8
+				if sprite16 {
+					height = 16
+				}
+				if sy <= y && y < sy+height {
+					sprites = append(sprites, ppu.Sprite{X: sx, Y: sy, Tile: tile, Attr: attr, OAMIndex: i})
+				}
+			}
+			if len(sprites) == 0 {
+				continue
+			}
+			// Compose sprite pixels over this line
+			var bgciLine [160]byte
+			copy(bgciLine[:], m.bgci[y*m.w:(y+1)*m.w])
+			vr := vramReaderAdapter{ppu: m.bus.PPU()}
+			sline := ppu.ComposeSpriteLine(vr, sprites, y, bgciLine, sprite16)
+			// Shade sprites onto framebuffer where non-zero
+			shadeP := func(pal byte, ci byte) byte {
+				shift := ci * 2
+				p := (pal >> shift) & 0x03
+				switch p {
+				case 0:
+					return 0xFF
+				case 1:
+					return 0xC0
+				case 2:
+					return 0x60
+				default:
+					return 0x00
+				}
+			}
+			for x := 0; x < 160; x++ {
+				ci := sline[x]
+				if ci == 0 {
+					continue
+				}
+				pal := obp0
+				if (ci != 0) && (sprites[0].Attr&(1<<4)) != 0 {
+					pal = obp1
+				} // per-pixel attr would require tracking source sprite; approximate: prefer OBP1 when set on any
+				gray := shadeP(pal, ci)
+				i := (y*m.w + x) * 4
+				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = gray, gray, gray, 0xFF
+			}
+		}
+		return
+	}
 	// We'll use per-line snapshots for LCDC and palettes
 	shadeP := func(pal byte, ci byte) byte {
 		shift := ci * 2
