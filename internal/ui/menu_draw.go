@@ -166,7 +166,8 @@ func (a *App) drawSettingsMenu(screen *ebiten.Image) {
 		fmt.Sprintf("Audio Adaptive: %s", map[bool]string{true: "On", false: "Off"}[a.cfg.AudioAdaptive]),
 		fmt.Sprintf("Low-Latency Audio: %s", map[bool]string{true: "On", false: "Off"}[a.cfg.AudioLowLatency]),
 		fmt.Sprintf("BG Renderer: %s", map[bool]string{true: "Fetcher", false: "Classic"}[a.cfg.UseFetcherBG]),
-		fmt.Sprintf("Shader: %s", map[string]string{"off":"Off","lcd":"LCD","crt":"CRT","ghost":"Ghost"}[a.cfg.ShaderPreset]),
+		fmt.Sprintf("Shader: %s", map[string]string{"off": "Off", "lcd": "LCD", "crt": "CRT", "ghost": "Ghost", "dot": "Dot"}[a.cfg.ShaderPreset]),
+		fmt.Sprintf("Jitter: %s", map[bool]string{true: "On", false: "Off"}[a.cfg.Jitter]),
 		fmt.Sprintf("ROMs Dir: %s", a.truncateText(romDir, a.maxCharsForText(10)-11)),
 		fmt.Sprintf("CGB Colors: %s", map[bool]string{true: "On", false: "Off"}[a.m != nil && a.m.WantCGBColors()]),
 	}
@@ -174,8 +175,14 @@ func (a *App) drawSettingsMenu(screen *ebiten.Image) {
 	if a.m != nil && a.m.IsCGBCompat() {
 		pid := a.m.CurrentCompatPalette()
 		items = append(items, fmt.Sprintf("Compat Palette: %d - %s  ([/]): cycle", pid, a.m.CompatPaletteName(pid)))
-		items = append(items, fmt.Sprintf("Shell Overlay: %s  (F10 toggles)", map[bool]string{true: "On", false: "Off"}[a.cfg.ShellOverlay]))
 	}
+	// Always show shell overlay and skin selectors
+	items = append(items, fmt.Sprintf("Shell Overlay: %s  (F10 toggles)", map[bool]string{true: "On", false: "Off"}[a.cfg.ShellOverlay]))
+	skin := "None"
+	if a.cfg.ShellImage != "" {
+		skin = filepath.Base(a.cfg.ShellImage)
+	}
+	items = append(items, fmt.Sprintf("Shell Skin: %s", skin))
 	baseY := cursorY
 	maxRows := (a.curH - baseY) / 14
 	if maxRows < 1 {

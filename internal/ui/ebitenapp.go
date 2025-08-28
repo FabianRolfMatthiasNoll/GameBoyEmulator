@@ -20,16 +20,18 @@ import (
 )
 
 type App struct {
-	cfg     Config
-	m       *emu.Machine
-	tex     *ebiten.Image
-	shader  *ebiten.Shader // active shader
-	paused  bool
-	fast    bool
-	turbo   int  // turbo speed multiplier (1=off)
-	skipOn  bool // whether to skip rendering frames
-	skipN   int  // render 1 of (skipN+1) frames
-	skipCtr int  // counter for frame skip
+	cfg    Config
+	m      *emu.Machine
+	tex    *ebiten.Image
+	shader *ebiten.Shader // active shader
+	// track current preset to recompile when it changes
+	shaderPreset string
+	paused       bool
+	fast         bool
+	turbo        int  // turbo speed multiplier (1=off)
+	skipOn       bool // whether to skip rendering frames
+	skipN        int  // render 1 of (skipN+1) frames
+	skipCtr      int  // counter for frame skip
 	// timing
 	lastTime   time.Time
 	frameAcc   float64 // accumulated fractional frames
@@ -76,6 +78,9 @@ type App struct {
 
 	// shader resources
 	ghostTex *ebiten.Image // previous frame for ghosting
+
+	// jitter state
+	drawCount int
 
 	// current logical screen size
 	curW int
@@ -481,6 +486,15 @@ func (a *App) Draw(screen *ebiten.Image) {
 	a.tex.WritePixels(a.m.Framebuffer())
 	dx := (oW - 160) / 2
 	dy := (oH - 144) / 2
+	// Optional subtle vertical jitter for retro feel
+	jitterOffset := 0.0
+	if a.cfg.Jitter {
+		// Every ~2 seconds, nudge for one frame by 0.5px
+		a.drawCount++
+		if a.drawCount%120 == 0 { // assuming ~60fps
+			jitterOffset = 0.5
+		}
+	}
 	if dx < 0 {
 		dx = 0
 	}
@@ -494,7 +508,7 @@ func (a *App) Draw(screen *ebiten.Image) {
 		if a.shader != nil {
 			// Draw with shader: pass the game image and optional previous frame
 			op := &ebiten.DrawRectShaderOptions{}
-			op.GeoM.Translate(float64(dx), float64(dy))
+			op.GeoM.Translate(float64(dx), float64(dy)+jitterOffset)
 			op.Images[0] = a.tex
 			if a.cfg.ShaderPreset == "ghost" && a.ghostTex != nil {
 				op.Images[1] = a.ghostTex
@@ -510,12 +524,12 @@ func (a *App) Draw(screen *ebiten.Image) {
 			}
 		} else {
 			var op ebiten.DrawImageOptions
-			op.GeoM.Translate(float64(dx), float64(dy))
+			op.GeoM.Translate(float64(dx), float64(dy)+jitterOffset)
 			screen.DrawImage(a.tex, &op)
 		}
 	} else {
 		var op ebiten.DrawImageOptions
-		op.GeoM.Translate(float64(dx), float64(dy))
+		op.GeoM.Translate(float64(dx), float64(dy)+jitterOffset)
 		screen.DrawImage(a.tex, &op)
 	}
 
@@ -613,19 +627,19 @@ func Fragment(position vec4, srcPos vec2, color vec4) vec4 {
 	c := imageSrc0At(srcPos)
 	// scanlines every other row
 	if mod(floor(srcPos.y), 2.0) == 0.0 {
-		c.rgb *= 0.88
+		c.rgb *= 0.80
 	}
 	// very subtle barrel distortion vignette
 	sz := imageSrc0Size()
 	uv := (srcPos / sz) * 2.0 - 1.0
 	r2 := dot(uv, uv)
-	vignette := 1.0 - 0.06*r2
+	vignette := 1.0 - 0.10*r2
 	c.rgb *= vignette
 	// gentle bloom by sampling 4 neighbors
 	off := vec2(1.0, 1.0)
 	s := imageSrc0At(srcPos + vec2(1.0,0.0)).rgb + imageSrc0At(srcPos + vec2(-1.0,0.0)).rgb +
 		 imageSrc0At(srcPos + vec2(0.0,1.0)).rgb + imageSrc0At(srcPos + vec2(0.0,-1.0)).rgb
-	c.rgb = mix(c.rgb, s/4.0, 0.08)
+	c.rgb = mix(c.rgb, s/4.0, 0.15)
 	return c
 }
 `
@@ -639,8 +653,35 @@ func Fragment(position vec4, srcPos vec2, color vec4) vec4 {
 	cur := imageSrc0At(srcPos)
 	prev := imageSrc1At(srcPos)
 	// Blend with previous frame
-	rgb := mix(cur.rgb, prev.rgb, 0.25)
+	rgb := mix(cur.rgb, prev.rgb, 0.45)
 	return vec4(rgb, cur.a)
+}
+`
+
+// Dot-matrix shader: emulate DMG dot matrix with circular mask and light neighbor bleed
+const dotShaderSrc = `
+//kage:unit pixels
+package main
+
+func Fragment(position vec4, srcPos vec2, color vec4) vec4 {
+	c := imageSrc0At(srcPos)
+	// Fractional position within the pixel
+	// (avoid fract() for portability)
+	fx := srcPos.x - floor(srcPos.x)
+	fy := srcPos.y - floor(srcPos.y)
+	p := vec2(fx, fy)
+	// Circular dot mask centered at 0.5 with soft edge
+	d := distance(p, vec2(0.5, 0.5))
+	// Approximate smoothstep(0.6, 0.45, d)
+	t := (0.55 - d) / 0.15
+	if t < 0.0 { t = 0.0 }
+	if t > 1.0 { t = 1.0 }
+	mask := t
+	// light cross-bleed to neighboring pixels
+	nb := (imageSrc0At(srcPos + vec2(1.0,0.0)).rgb + imageSrc0At(srcPos + vec2(-1.0,0.0)).rgb +
+		   imageSrc0At(srcPos + vec2(0.0,1.0)).rgb + imageSrc0At(srcPos + vec2(0.0,-1.0)).rgb) / 4.0
+	rgb := mix(c.rgb, nb, 0.12) * mask
+	return vec4(rgb, c.a)
 }
 `
 
@@ -658,6 +699,7 @@ func (a *App) ensureShader() {
 	// If off, release shader
 	if preset == "off" {
 		a.shader = nil
+		a.shaderPreset = "off"
 		return
 	}
 	// Determine current shader source by preset
@@ -669,13 +711,16 @@ func (a *App) ensureShader() {
 		src = crtShaderSrc
 	case "ghost":
 		src = ghostShaderSrc
+	case "dot":
+		src = dotShaderSrc
 	default:
 		src = lcdShaderSrc
 	}
 	// If no shader or switching preset, (re)compile
-	if a.shader == nil {
+	if a.shader == nil || a.shaderPreset != preset {
 		if s, err := ebiten.NewShader([]byte(src)); err == nil {
 			a.shader = s
+			a.shaderPreset = preset
 		}
 	}
 }

@@ -16,6 +16,9 @@ A fast, portable Game Boy (DMG) and Game Boy Color (CGB) emulator written in Go 
 - Save/Load state per ROM + per-slot, separate from battery saves
 - Screenshot capture (PNG)
 - Configurable audio buffer/latency and BG renderer path
+- Visual shader presets: Off, LCD, CRT, Ghost, Dot matrix
+- Optional subtle vertical jitter for a retro LCD feel
+- Optional translucent shell overlay with selectable skins
 
 ## Screenshots
 
@@ -48,7 +51,13 @@ go run ./cmd/gbemu -rom path\to\game.gb
   - Palette cycle (DMG-on-CGB): [ and ]
   - Speed: Tab; Increase: F7; Decrease: F6
 
-- Settings (in-app): scale, audio (stereo/mono), low-latency audio, BG renderer, ROMs directory, CGB Colors toggle, compat palette.
+- Settings (in-app):
+  - Scale, audio (stereo/mono), audio adaptive/low-latency
+  - BG renderer
+  - Shader preset (Off/LCD/CRT/Ghost/Dot) and Jitter toggle
+  - ROMs directory
+  - CGB Colors toggle and compat palette (when in compatibility mode)
+  - Shell overlay and skin
 
 ## ROMs and saves
 

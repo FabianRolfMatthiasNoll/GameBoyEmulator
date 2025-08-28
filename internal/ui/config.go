@@ -13,7 +13,8 @@ type Config struct {
 	UseFetcherBG    bool   // render BG via fetcher/FIFO
 	// Visual effects
 	LCDShader    bool   // legacy: apply LCD-like shader (deprecated; use ShaderPreset)
-	ShaderPreset string // off|lcd|crt|ghost
+	ShaderPreset string // off|lcd|crt|ghost|dot
+	Jitter       bool   // slight vertical jitter for retro vibe
 	// Visual overlay skin
 	ShellOverlay bool   // draw an alpha-blended overlay image over the game view
 	ShellImage   string // path to the overlay image (PNG)
@@ -51,4 +52,6 @@ func (c *Config) Defaults() {
 			c.ShaderPreset = "off"
 		}
 	}
+	// Default jitter off
+	// (Leave as false unless explicitly enabled by user)
 }
