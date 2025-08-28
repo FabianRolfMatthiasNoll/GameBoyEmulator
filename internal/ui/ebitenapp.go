@@ -94,6 +94,14 @@ func NewApp(cfg Config, m *emu.Machine) *App {
 		a.romSel = 0
 		a.romOff = 0
 	}
+	// If a ROM is already loaded, include its title in the window title
+	if m != nil && m.ROMPath() != "" {
+		title := cfg.Title
+		if t := m.ROMTitle(); t != "" {
+			title = cfg.Title + " - [" + t + "]"
+		}
+		ebiten.SetWindowTitle(title)
+	}
 	// default save-state slot
 	a.currentSlot = 0
 	// init ROM dir input for editing
@@ -362,6 +370,12 @@ func (a *App) Update() error {
 						if a.m.WantCGBColors() && !a.m.UseCGBBG() {
 							a.m.ResetCGBPostBoot(true)
 						}
+						// Update window title with game title
+						title := a.cfg.Title
+						if t := a.m.ROMTitle(); t != "" {
+							title = a.cfg.Title + " - [" + t + "]"
+						}
+						ebiten.SetWindowTitle(title)
 						// Apply saved per-ROM palette preference, if any
 						if a.m.IsCGBCompat() && a.cfg.PerROMCompatPalette != nil {
 							if pid, ok := a.cfg.PerROMCompatPalette[path]; ok {
@@ -1037,7 +1051,8 @@ func (a *App) findROMs() []string {
 				continue
 			}
 			name := e.Name()
-			if strings.HasSuffix(strings.ToLower(name), ".gb") {
+			ln := strings.ToLower(name)
+			if strings.HasSuffix(ln, ".gb") || strings.HasSuffix(ln, ".gbc") {
 				files = append(files, filepath.Join(dir, name))
 			}
 		}

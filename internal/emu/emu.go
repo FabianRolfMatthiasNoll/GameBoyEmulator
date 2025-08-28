@@ -37,6 +37,8 @@ type Machine struct {
 	// Selected compatibility palette ID (0 = default) when in cgbCompat.
 	// 0..len(cgbCompatSets)-1; out-of-range will wrap.
 	cgbCompatID int
+
+	romTitle string // decoded title from header (trimmed)
 }
 
 // Human-friendly names for the curated DMG-on-CGB compatibility palettes.
@@ -59,6 +61,11 @@ func (m *Machine) LoadCartridge(rom []byte, boot []byte) error {
 		return err
 	}
 	_ = romHeader
+	if romHeader != nil {
+		m.romTitle = romHeader.Title
+	} else {
+		m.romTitle = ""
+	}
 	// Record whether the ROM supports or requires CGB features
 	m.cgbCapable = false
 	if romHeader != nil {
@@ -266,6 +273,9 @@ func (m *Machine) LoadROMFromFile(path string) error {
 func (m *Machine) ROMPath() string {
 	return m.romPath
 }
+
+// ROMTitle returns the title extracted from the ROM header, if available.
+func (m *Machine) ROMTitle() string { return m.romTitle }
 
 // SetROMPath sets the current ROM path (used by UI for state/save association).
 // This does not reload the ROM and should be called only after a successful cartridge load.
