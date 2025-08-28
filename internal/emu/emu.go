@@ -279,23 +279,18 @@ func (m *Machine) SetBootROM(data []byte) {
 	} else {
 		m.bootROM = nil
 	}
-	if m.bus != nil {
-		m.bus.SetBootROM(m.bootROM)
-	}
 }
 
-// SetCGBBootROM sets the CGB boot ROM used when starting CGB-capable games.
+// SetCGBBootROM sets the CGB boot ROM image.
 func (m *Machine) SetCGBBootROM(data []byte) {
 	if len(data) >= 0x800 {
 		m.cgbBootROM = make([]byte, 0x800)
-		copy(m.cgbBootROM, data[len(data)-0x800:])
-	} else if len(data) >= 0x900 {
-		m.cgbBootROM = make([]byte, 0x800)
+		// accept either full 0x800 CGB boot or a larger blob containing it
 		copy(m.cgbBootROM, data[len(data)-0x800:])
 	} else {
 		m.cgbBootROM = nil
 	}
-	if m.bus != nil {
+	if m.bus != nil && len(m.cgbBootROM) >= 0x800 {
 		m.bus.SetCGBBootROM(m.cgbBootROM)
 	}
 }
@@ -496,32 +491,14 @@ func (m *Machine) CompatPaletteName(id int) string {
 // CompatPaletteCount returns the number of available compat palettes.
 func (m *Machine) CompatPaletteCount() int { return len(cgbCompatSetNames) }
 
-// computeCompatPaletteIDFromROM approximates the CGB boot's palette ID selection for DMG games.
-// For now, use a simple heuristic based on Nintendo licensee and title checksum, mapping into 0..5.
-// Returns (id, true) if computed; otherwise (0, false).
+// computeCompatPaletteIDFromROM chooses a DMG-on-CGB palette using header tables and heuristics.
 func computeCompatPaletteIDFromROM(rom []byte) (int, bool) {
-	if len(rom) < 0x150 {
-		return 0, false
+	if h, err := cart.ParseHeader(rom); err == nil {
+		if id, ok := autoCompatPaletteFromHeader(h); ok {
+			return id, true
+		}
 	}
-	oldLic := rom[0x014B]
-	newLic := string(rom[0x0144:0x0146])
-	nintendo := false
-	if oldLic == 0x33 {
-		nintendo = (newLic == "01")
-	} else {
-		nintendo = (oldLic == 0x01)
-	}
-	if !nintendo {
-		return 0, true // default palette
-	}
-	// Sum of 16 title bytes
-	sum := 0
-	for i := 0; i < 16; i++ {
-		sum += int(rom[0x0134+i])
-	}
-	// Map sum into our palette range 0..5 using a stable hash
-	id := sum % 6
-	return id, true
+	return 0, true
 }
 
 // SetSerialWriter connects an io.Writer to receive bytes written to the serial port (FF01/FF02).
