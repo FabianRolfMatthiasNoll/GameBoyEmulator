@@ -445,6 +445,7 @@ type ppuState struct {
 	OBJPal        [64]byte
 	BCPS          byte
 	OCPS          byte
+	VBK           byte
 	BGPalWritten  bool
 	OBJPalWritten bool
 	LCDC          byte
@@ -468,7 +469,7 @@ func (p *PPU) SaveState() []byte {
 	enc := gob.NewEncoder(&buf)
 	s := ppuState{
 		VRAM: p.vram, VRAM1: p.vram1, OAM: p.oam,
-		BGPal: p.bgPal, OBJPal: p.objPal, BCPS: p.bcps, OCPS: p.ocps,
+		BGPal: p.bgPal, OBJPal: p.objPal, BCPS: p.bcps, OCPS: p.ocps, VBK: p.vbk,
 		BGPalWritten: p.bgPalWritten, OBJPalWritten: p.objPalWritten,
 		LCDC: p.lcdc, STAT: p.stat, SCY: p.scy, SCX: p.scx, LY: p.ly, LYC: p.lyc,
 		BGP: p.bgp, OBP0: p.obp0, OBP1: p.obp1, WY: p.wy, WX: p.wx,
@@ -491,6 +492,7 @@ func (p *PPU) LoadState(data []byte) {
 	p.objPal = s.OBJPal
 	p.bcps = s.BCPS
 	p.ocps = s.OCPS
+	p.vbk = s.VBK
 	p.bgPalWritten = s.BGPalWritten
 	p.objPalWritten = s.OBJPalWritten
 	p.lcdc, p.stat, p.scy, p.scx, p.ly, p.lyc = s.LCDC, s.STAT, s.SCY, s.SCX, s.LY, s.LYC

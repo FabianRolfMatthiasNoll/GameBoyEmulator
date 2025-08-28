@@ -670,6 +670,7 @@ func (b *Bus) updateJoypadIRQ() {
 // --- Save/Load state ---
 type busState struct {
 	WRAM      [0x2000]byte
+	WRAMBanks [7][0x1000]byte
 	HRAM      [0x7F]byte
 	IE, IF    byte
 	JoypSel   byte
@@ -687,7 +688,12 @@ type busState struct {
 	DMASrc    uint16
 	DMAIdx    int
 	BootEn    bool
-	APU       []byte
+	// CGB-related state
+	CGBMode     bool
+	WRAMBankID  byte
+	KEY1        byte
+	DoubleSpeed bool
+	APU         []byte
 	// PPU and cartridge will handle their own state via their interfaces
 }
 
@@ -695,13 +701,17 @@ func (b *Bus) SaveState() []byte {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 	s := busState{
-		WRAM: b.wram, HRAM: b.hram,
+		WRAM: b.wram, WRAMBanks: b.wramBanks, HRAM: b.hram,
 		IE: b.ie, IF: b.ifReg,
 		JoypSel: b.joypSelect, Joypad: b.joypad, JoypL4: b.joypLower4,
 		DIV: b.div, TIMA: b.tima, TMA: b.tma, TAC: b.tac, TIMARelay: b.timaReloadDelay,
 		SB: b.sb, SC: b.sc, DivInt: b.divInternal,
 		DMA: b.dma, DMAActive: b.dmaActive, DMASrc: b.dmaSrc, DMAIdx: b.dmaIndex,
-		BootEn: b.bootEnabled,
+		BootEn:      b.bootEnabled,
+		CGBMode:     b.cgbMode,
+		WRAMBankID:  b.wramBankID,
+		KEY1:        b.key1,
+		DoubleSpeed: b.doubleSpeed,
 	}
 	_ = enc.Encode(s)
 	// Append PPU and Cart states after a simple header so we can restore later
@@ -736,6 +746,7 @@ func (b *Bus) LoadState(data []byte) {
 		return
 	}
 	b.wram = s.WRAM
+	b.wramBanks = s.WRAMBanks
 	b.hram = s.HRAM
 	b.ie, b.ifReg = s.IE, s.IF
 	b.joypSelect, b.joypad, b.joypLower4 = s.JoypSel, s.Joypad, s.JoypL4
@@ -743,6 +754,14 @@ func (b *Bus) LoadState(data []byte) {
 	b.sb, b.sc, b.divInternal = s.SB, s.SC, s.DivInt
 	b.dma, b.dmaActive, b.dmaSrc, b.dmaIndex = s.DMA, s.DMAActive, s.DMASrc, s.DMAIdx
 	b.bootEnabled = s.BootEn
+	// Restore CGB exposure and related flags exactly as saved
+	b.cgbMode = s.CGBMode
+	b.wramBankID = s.WRAMBankID
+	if b.wramBankID == 0 {
+		b.wramBankID = 1
+	}
+	b.key1 = s.KEY1
+	b.doubleSpeed = s.DoubleSpeed
 	// PPU
 	var ps []byte
 	if err := dec.Decode(&ps); err == nil && b.ppu != nil {

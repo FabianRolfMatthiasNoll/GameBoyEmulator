@@ -31,6 +31,12 @@ type Machine struct {
 	cgbBootROM []byte
 	// ROM capability (from header): if false, do not expose CGB hardware even if toggle is on
 	cgbCapable bool
+	// If true, we are running a DMG ROM on CGB hardware (compatibility mode):
+	// use BG palette 0 and OBJ palettes 0/1 with BGP/OBP mapping into CRAM.
+	cgbCompat bool
+	// Selected compatibility palette ID (0 = default) when in cgbCompat.
+	// 0..len(cgbCompatSets)-1; out-of-range will wrap.
+	cgbCompatID int
 }
 
 func New(cfg Config) *Machine {
@@ -103,15 +109,99 @@ func (m *Machine) LoadCartridge(rom []byte, boot []byte) error {
 			if m.bus != nil {
 				m.bus.SetCGBMode(true)
 			}
+			m.cgbCompat = false
 		} else {
 			// for pure DMG, default to classic
 			m.cfg.UseCGBBG = false
 			if m.bus != nil {
 				m.bus.SetCGBMode(false)
 			}
+			m.cgbCompat = false
 		}
 	}
+	// If user had CGB colors toggled on and this ROM is DMG-only, enable compatibility mode now
+	if !m.cgbCapable && m.cfg.UseCGBBG && m.bus != nil {
+		m.bus.SetCGBMode(true)
+		m.cgbCompat = true
+		// pick palette based on header checksum heuristic
+		if id, ok := computeCompatPaletteIDFromROM(rom); ok {
+			m.cgbCompatID = id
+		} else {
+			m.cgbCompatID = 0
+		}
+		m.seedCGBCompatPalettes()
+	}
 	return nil
+}
+
+// seedCGBCompatPalettes initializes CGB CRAM for DMG compatibility mode with a sane default.
+// This maps BGP/OBP grayscale to color hues to mimic GBC default compatibility palettes.
+// For now, use a simple green-ish default similar to DMG-on-GBC default.
+func (m *Machine) seedCGBCompatPalettes() {
+	m.seedCGBCompatPalettesID(m.cgbCompatID)
+}
+
+// seedCGBCompatPalettesID writes one of a few curated DMG-on-CGB color sets into CRAM.
+// The set provides 3 palettes: BG0, OBJ0, OBJ1. We approximate GBC boot behavior.
+func (m *Machine) seedCGBCompatPalettesID(id int) {
+	if m == nil || m.bus == nil || m.bus.PPU() == nil {
+		return
+	}
+	// A few curated palettes (light -> dark). Colors are 8-bit per channel.
+	type rgb struct{ r, g, b byte }
+	type set struct {
+		bg   [4]rgb
+		obj0 [4]rgb
+		obj1 [4]rgb
+	}
+	// Helper presets
+	green := [4]rgb{{0xE0, 0xF8, 0xD0}, {0x88, 0xC0, 0x70}, {0x34, 0x68, 0x56}, {0x08, 0x18, 0x20}}
+	sepia := [4]rgb{{0xF8, 0xE8, 0xC8}, {0xD0, 0xB8, 0x90}, {0x90, 0x70, 0x50}, {0x30, 0x20, 0x10}}
+	blue := [4]rgb{{0xE0, 0xF0, 0xFF}, {0x80, 0xB0, 0xE8}, {0x30, 0x60, 0xA8}, {0x10, 0x18, 0x30}}
+	red := [4]rgb{{0xFF, 0xE0, 0xE0}, {0xE8, 0x80, 0x80}, {0xB0, 0x30, 0x30}, {0x30, 0x10, 0x10}}
+	pastel := [4]rgb{{0xFF, 0xFF, 0xFF}, {0xCC, 0xEE, 0xCC}, {0x99, 0xCC, 0xCC}, {0x66, 0x99, 0x99}}
+	gray := [4]rgb{{0xFF, 0xFF, 0xFF}, {0xC0, 0xC0, 0xC0}, {0x60, 0x60, 0x60}, {0x00, 0x00, 0x00}}
+	// Build sets (BG, OBJ0, OBJ1). Keep BG vivid, give sprites slight contrast variants.
+	cgbCompatSets := []set{
+		{bg: green, obj0: green, obj1: sepia},  // 0 default green with sepia alt
+		{bg: sepia, obj0: sepia, obj1: green},  // 1 sepia bg
+		{bg: blue, obj0: blue, obj1: pastel},   // 2 blue bg
+		{bg: red, obj0: red, obj1: sepia},      // 3 red bg
+		{bg: pastel, obj0: pastel, obj1: gray}, // 4 pastel
+		{bg: gray, obj0: gray, obj1: green},    // 5 neutral gray
+	}
+	if id < 0 {
+		id = 0
+	}
+	if id >= len(cgbCompatSets) {
+		id = id % len(cgbCompatSets)
+	}
+	sel := cgbCompatSets[id]
+	// Helper: write one RGB555 color via palette ports (auto-increment assumed)
+	writeRGB := func(dataReg uint16, r8, g8, b8 byte) {
+		r5 := byte(uint16(r8) >> 3)
+		g5 := byte(uint16(g8) >> 3)
+		b5 := byte(uint16(b8) >> 3)
+		v := uint16(r5) | (uint16(g5) << 5) | (uint16(b5) << 10)
+		m.bus.Write(dataReg, byte(v&0xFF))
+		m.bus.Write(dataReg, byte(v>>8))
+	}
+	// BG palette 0 at BCPS index 0 with auto-increment
+	m.bus.Write(0xFF68, 0x80)
+	for i := 0; i < 4; i++ {
+		c := sel.bg[i]
+		writeRGB(0xFF69, c.r, c.g, c.b)
+	}
+	// OBJ palettes 0 and 1: total 8 colors (we’ll write both palettes sequentially)
+	m.bus.Write(0xFF6A, 0x80)
+	for i := 0; i < 4; i++ { // OBJ0
+		c := sel.obj0[i]
+		writeRGB(0xFF6B, c.r, c.g, c.b)
+	}
+	for i := 0; i < 4; i++ { // OBJ1
+		c := sel.obj1[i]
+		writeRGB(0xFF6B, c.r, c.g, c.b)
+	}
 }
 
 // SetUseFetcherBG toggles the BG renderer between classic and fetcher-based path.
@@ -121,13 +211,29 @@ func (m *Machine) SetUseFetcherBG(on bool) { m.cfg.UseFetcherBG = on }
 func (m *Machine) SetUseCGBBG(on bool) {
 	m.cfg.UseCGBBG = on
 	if m.bus != nil {
-		// Only expose CGB hardware if the loaded ROM is CGB-capable
-		m.bus.SetCGBMode(on && m.cgbCapable)
+		// Expose CGB hardware when turning on; DMG ROMs will run in compatibility mode
+		if on {
+			m.bus.SetCGBMode(true)
+			// Enter or exit compatibility mode depending on ROM capability
+			m.cgbCompat = !m.cgbCapable
+			if m.cgbCompat {
+				// keep current chosen compat ID
+				m.seedCGBCompatPalettes()
+			}
+		} else {
+			// Disable CGB hardware exposure when turning off for dual carts; for DMG carts this
+			// returns to classic behavior as well
+			m.bus.SetCGBMode(false)
+			m.cgbCompat = false
+		}
 	}
 }
 
 // UseCGBBG reports whether the CGB rendering path is enabled.
 func (m *Machine) UseCGBBG() bool { return m.cfg.UseCGBBG && m.cgbCapable }
+
+// WantCGBColors reports the user's intent to enable CGB colorization (even for DMG ROMs).
+func (m *Machine) WantCGBColors() bool { return m.cfg.UseCGBBG }
 
 // LoadROMFromFile replaces the current cartridge with a ROM from disk, preserving boot ROM setting.
 func (m *Machine) LoadROMFromFile(path string) error {
@@ -143,6 +249,13 @@ func (m *Machine) LoadROMFromFile(path string) error {
 		return err
 	}
 	m.romPath = path
+	// When in DMG compat mode after load, try to compute a palette ID from header
+	if m.cgbCompat {
+		if id, ok := computeCompatPaletteIDFromROM(data); ok {
+			m.cgbCompatID = id
+			m.seedCGBCompatPalettesID(id)
+		}
+	}
 	return nil
 }
 
@@ -237,6 +350,8 @@ func (m *Machine) ResetCGBPostBoot(compat bool) {
 	}
 	// Expose CGB hardware to the CPU
 	m.bus.SetCGBMode(true)
+	// Track compatibility mode for DMG ROMs under CGB
+	m.cgbCompat = compat
 	// Clear any boot mapping
 	m.bus.EnableBoot(0)
 	// CPU state like CGB after boot
@@ -245,6 +360,10 @@ func (m *Machine) ResetCGBPostBoot(compat bool) {
 	m.cpu.A = 0x11 // indicate CGB hardware per Pan Docs
 	// Set minimal IO similar to applyDMGPostBootIO
 	m.applyDMGPostBootIO()
+	// Seed default compatibility palettes when running a DMG ROM under CGB
+	if compat {
+		m.seedCGBCompatPalettes()
+	}
 }
 
 // applyDMGPostBootIO sets a minimal set of IO registers to DMG post-boot defaults,
@@ -324,6 +443,68 @@ func (m *Machine) StepFrame() {
 
 func (m *Machine) Framebuffer() []byte { return m.fb }
 
+// IsCGBCompat reports if we're running a DMG ROM under CGB colorization.
+func (m *Machine) IsCGBCompat() bool { return m != nil && m.cgbCompat }
+
+// CurrentCompatPalette returns the current compat palette ID (0-based).
+func (m *Machine) CurrentCompatPalette() int { return m.cgbCompatID }
+
+// SetCompatPalette selects a compat palette ID and seeds CRAM accordingly.
+func (m *Machine) SetCompatPalette(id int) {
+	if !m.cgbCompat {
+		return
+	}
+	if id < 0 {
+		id = 0
+	}
+	m.cgbCompatID = id
+	m.seedCGBCompatPalettesID(id)
+}
+
+// CycleCompatPalette increments the compat palette with wrap-around across available sets.
+func (m *Machine) CycleCompatPalette(delta int) {
+	if !m.cgbCompat {
+		return
+	}
+	// We know we defined 6 sets above; keep wrap simple. If definition changes, wrap after seeding once.
+	const total = 6
+	id := m.cgbCompatID + delta
+	for id < 0 {
+		id += total
+	}
+	id = id % total
+	m.cgbCompatID = id
+	m.seedCGBCompatPalettesID(id)
+}
+
+// computeCompatPaletteIDFromROM approximates the CGB boot's palette ID selection for DMG games.
+// For now, use a simple heuristic based on Nintendo licensee and title checksum, mapping into 0..5.
+// Returns (id, true) if computed; otherwise (0, false).
+func computeCompatPaletteIDFromROM(rom []byte) (int, bool) {
+	if len(rom) < 0x150 {
+		return 0, false
+	}
+	oldLic := rom[0x014B]
+	newLic := string(rom[0x0144:0x0146])
+	nintendo := false
+	if oldLic == 0x33 {
+		nintendo = (newLic == "01")
+	} else {
+		nintendo = (oldLic == 0x01)
+	}
+	if !nintendo {
+		return 0, true // default palette
+	}
+	// Sum of 16 title bytes
+	sum := 0
+	for i := 0; i < 16; i++ {
+		sum += int(rom[0x0134+i])
+	}
+	// Map sum into our palette range 0..5 using a stable hash
+	id := sum % 6
+	return id, true
+}
+
 // SetSerialWriter connects an io.Writer to receive bytes written to the serial port (FF01/FF02).
 // Useful for running test ROMs that report via serial.
 func (m *Machine) SetSerialWriter(w interface{ Write([]byte) (int, error) }) {
@@ -374,8 +555,10 @@ func (m *Machine) APUCapBufferedStereo(target int) {
 
 // --- Save/Load state ---
 type machineState struct {
-	Bus []byte
-	CPU []byte
+	Bus         []byte
+	CPU         []byte
+	CGBCompat   bool
+	CGBCompatID int
 }
 
 func (m *Machine) SaveState() []byte {
@@ -384,7 +567,12 @@ func (m *Machine) SaveState() []byte {
 	}
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
-	_ = enc.Encode(machineState{Bus: m.bus.SaveState(), CPU: m.cpu.SaveState()})
+	_ = enc.Encode(machineState{
+		Bus:         m.bus.SaveState(),
+		CPU:         m.cpu.SaveState(),
+		CGBCompat:   m.cgbCompat,
+		CGBCompatID: m.cgbCompatID,
+	})
 	return buf.Bytes()
 }
 
@@ -399,6 +587,14 @@ func (m *Machine) LoadState(data []byte) error {
 	}
 	m.bus.LoadState(s.Bus)
 	m.cpu.LoadState(s.CPU)
+	// Restore compat mode flag and palette, re-seed palettes if needed
+	m.cgbCompat = s.CGBCompat
+	m.cgbCompatID = s.CGBCompatID
+	if m.cgbCompat {
+		// Ensure CGB hardware is exposed and palettes are in CRAM
+		m.bus.SetCGBMode(true)
+		m.seedCGBCompatPalettesID(m.cgbCompatID)
+	}
 	return nil
 }
 
@@ -550,27 +746,32 @@ func (m *Machine) renderBG() {
 			// Adapter to PPU RawVRAM for VRAMReader interface
 			vr := vramReaderAdapter{ppu: m.bus.PPU()}
 			line := ppu.RenderBGScanlineUsingFetcher(vr, bgMapBase, tileData8000, lr.SCX, lr.SCY, byte(y))
-			// Shade and write out
+			// Shade and write out: if in CGB compatibility mode, map via CRAM BG palette 0; otherwise DMG grayscale
 			bgp := lr.BGP
-			shade := func(ci byte) byte {
+			useCompat := m.cgbCompat && m.bus.PPU().BGPalReady()
+			shade := func(ci byte) (r, g, b byte) {
+				if useCompat {
+					// In compatibility mode, BGP indexes colors within CGB BG palette 0
+					return m.bus.PPU().BGColorRGB(0, ci)
+				}
 				shift := ci * 2
 				pal := (bgp >> shift) & 0x03
 				switch pal {
 				case 0:
-					return 0xFF
+					return 0xFF, 0xFF, 0xFF
 				case 1:
-					return 0xC0
+					return 0xC0, 0xC0, 0xC0
 				case 2:
-					return 0x60
+					return 0x60, 0x60, 0x60
 				default:
-					return 0x00
+					return 0x00, 0x00, 0x00
 				}
 			}
 			for x := 0; x < 160; x++ {
 				ci := line[x]
-				s := shade(ci)
+				r, g, b := shade(ci)
 				i := (y*m.w + x) * 4
-				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = s, s, s, 0xFF
+				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = r, g, b, 0xFF
 				m.bgci[y*m.w+x] = ci
 			}
 		}
@@ -823,18 +1024,22 @@ func (m *Machine) renderWindow() {
 		fineY := winY % 8
 		// Palette snapshot
 		bgp := lr.BGP
-		shade := func(ci byte) byte {
+		useCompat := m.cgbCompat && m.bus.PPU().BGPalReady()
+		shade := func(ci byte) (byte, byte, byte) {
+			if useCompat {
+				return m.bus.PPU().BGColorRGB(0, ci)
+			}
 			shift := ci * 2
 			pal := (bgp >> shift) & 0x03
 			switch pal {
 			case 0:
-				return 0xFF
+				return 0xFF, 0xFF, 0xFF
 			case 1:
-				return 0xC0
+				return 0xC0, 0xC0, 0xC0
 			case 2:
-				return 0x60
+				return 0x60, 0x60, 0x60
 			default:
-				return 0x00
+				return 0x00, 0x00, 0x00
 			}
 		}
 		for x := max(0, winXStart); x < 160; x++ {
@@ -852,11 +1057,11 @@ func (m *Machine) renderWindow() {
 			hi := m.bus.PPU().RawVRAM(tileAddr + 1)
 			bit := 7 - (winX % 8)
 			ci := ((hi>>bit)&1)<<1 | ((lo >> bit) & 1)
-			s := shade(ci)
+			r, g, b := shade(ci)
 			i := (y*m.w + x) * 4
-			m.fb[i+0] = s
-			m.fb[i+1] = s
-			m.fb[i+2] = s
+			m.fb[i+0] = r
+			m.fb[i+1] = g
+			m.fb[i+2] = b
 			m.fb[i+3] = 0xFF
 			m.bgci[y*m.w+x] = ci
 		}
@@ -1052,19 +1257,23 @@ func (m *Machine) renderSprites() {
 			copy(bgciLine[:], m.bgci[y*m.w:(y+1)*m.w])
 			vr := vramReaderAdapter{ppu: m.bus.PPU()}
 			sline, palSel := ppu.ComposeSpriteLineExt(vr, sprites, y, bgciLine, sprite16)
-			// Shade sprites onto framebuffer where non-zero using OBP0/OBP1 based on palSel
-			shadeP := func(pal byte, ci byte) byte {
+			// Shade sprites: in CGB compatibility mode, map via OBJ CRAM palettes 0/1; else DMG grayscale
+			shadeP := func(palSelIdx byte, pal byte, ci byte) (r, g, b byte) {
+				if m.cgbCompat && m.bus.PPU().OBJPalReady() {
+					// palSelIdx 0->OBJ0, 1->OBJ1
+					return m.bus.PPU().OBJColorRGB(palSelIdx, ci)
+				}
 				shift := ci * 2
 				p := (pal >> shift) & 0x03
 				switch p {
 				case 0:
-					return 0xFF
+					return 0xFF, 0xFF, 0xFF
 				case 1:
-					return 0xC0
+					return 0xC0, 0xC0, 0xC0
 				case 2:
-					return 0x60
+					return 0x60, 0x60, 0x60
 				default:
-					return 0x00
+					return 0x00, 0x00, 0x00
 				}
 			}
 			for x := 0; x < 160; x++ {
@@ -1073,29 +1282,34 @@ func (m *Machine) renderSprites() {
 					continue
 				}
 				pal := obp0
+				idx := byte(0)
 				if palSel[x] == 1 {
 					pal = obp1
+					idx = 1
 				}
-				gray := shadeP(pal, ci)
+				r, g, b := shadeP(idx, pal, ci)
 				i := (y*m.w + x) * 4
-				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = gray, gray, gray, 0xFF
+				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = r, g, b, 0xFF
 			}
 		}
 		return
 	}
 	// We'll use per-line snapshots for LCDC and palettes
-	shadeP := func(pal byte, ci byte) byte {
+	shadeP := func(palSelIdx byte, pal byte, ci byte) (byte, byte, byte) {
+		if m.cgbCompat && m.bus.PPU().OBJPalReady() {
+			return m.bus.PPU().OBJColorRGB(palSelIdx, ci)
+		}
 		shift := ci * 2
 		p := (pal >> shift) & 0x03
 		switch p {
 		case 0:
-			return 0xFF
+			return 0xFF, 0xFF, 0xFF
 		case 1:
-			return 0xC0
+			return 0xC0, 0xC0, 0xC0
 		case 2:
-			return 0x60
+			return 0x60, 0x60, 0x60
 		default:
-			return 0x00
+			return 0x00, 0x00, 0x00
 		}
 	}
 
@@ -1110,13 +1324,9 @@ func (m *Machine) renderSprites() {
 		if lcdc == 0 {
 			lcdc = m.bus.Read(0xFF40)
 		}
-		if (lcdc & 0x80) == 0 {
+		if (lcdc&0x80) == 0 || (lcdc&0x02) == 0 {
 			continue
-		} // LCD off
-		if (lcdc & 0x02) == 0 {
-			continue
-		} // OBJ disabled
-		// sprite size for this line
+		}
 		sprite16 := (lcdc & 0x04) != 0
 		obp0 := lr.OBP0
 		obp1 := lr.OBP1
@@ -1124,7 +1334,6 @@ func (m *Machine) renderSprites() {
 			obp0 = m.bus.Read(0xFF48)
 			obp1 = m.bus.Read(0xFF49)
 		}
-		// Gather up to 10 candidate sprites for this scanline in OAM order
 		candidates := make([]oamEntry, 0, 10)
 		for i := 0; i < 40 && len(candidates) < 10; i++ {
 			base := uint16(0xFE00 + i*4)
@@ -1132,19 +1341,18 @@ func (m *Machine) renderSprites() {
 			sx := int(m.bus.PPU().RawOAM(base+1)) - 8
 			tile := m.bus.PPU().RawOAM(base + 2)
 			attr := m.bus.PPU().RawOAM(base + 3)
-			height := 8
+			h := 8
 			if sprite16 {
-				height = 16
+				h = 16
 			}
-			if sy <= y && y < sy+height {
+			if sy <= y && y < sy+h {
 				candidates = append(candidates, oamEntry{sy: sy, sx: sx, tile: tile, attr: attr, index: i})
 			}
 		}
 		if len(candidates) == 0 {
 			continue
 		}
-		// Stable sort by X ascending, then by OAM index to implement leftmost-X tie-breaker
-		// (11 objects are never considered; we already capped to 10)
+		// Stable sort by X then OAM index
 		for i := 0; i < len(candidates); i++ {
 			for j := i + 1; j < len(candidates); j++ {
 				if candidates[j].sx < candidates[i].sx || (candidates[j].sx == candidates[i].sx && candidates[j].index < candidates[i].index) {
@@ -1156,34 +1364,28 @@ func (m *Machine) renderSprites() {
 			bestFound := false
 			bestX := 0
 			bestIdx := 0
-			bestGray := byte(0)
+			bestR, bestG, bestB := byte(0), byte(0), byte(0)
 			for _, s := range candidates {
-				sy := s.sy
-				sx := s.sx
-				tile := s.tile
-				attr := s.attr
-				if x < sx || x >= sx+8 {
+				if x < s.sx || x >= s.sx+8 {
 					continue
 				}
 				// OBJ-to-BG priority: if bit7 set and BG/window pixel is non-zero, skip drawing
-				if (attr & (1 << 7)) != 0 {
-					if m.bgci[y*m.w+x] != 0 {
-						continue
-					}
+				if (s.attr&(1<<7)) != 0 && m.bgci[y*m.w+x] != 0 {
+					continue
 				}
-				row := int(y - sy)
-				col := int(x - sx)
-				if (attr & (1 << 6)) != 0 {
+				row := y - s.sy
+				col := x - s.sx
+				if (s.attr & (1 << 6)) != 0 { // Y flip
 					if sprite16 {
 						row = 15 - row
 					} else {
 						row = 7 - row
 					}
 				}
-				if (attr & (1 << 5)) != 0 {
+				if (s.attr & (1 << 5)) != 0 { // X flip
 					col = 7 - col
 				}
-				tIndex := tile
+				tIndex := s.tile
 				if sprite16 {
 					tIndex &= 0xFE
 					if row >= 8 {
@@ -1199,22 +1401,25 @@ func (m *Machine) renderSprites() {
 				if ci == 0 {
 					continue
 				}
-				if !bestFound || sx < bestX || (sx == bestX && s.index < bestIdx) {
-					pal := obp0
-					if (attr & (1 << 4)) != 0 {
-						pal = obp1
-					}
-					bestGray = shadeP(pal, ci)
-					bestX = sx
+				pal := obp0
+				idx := byte(0)
+				if (s.attr & (1 << 4)) != 0 {
+					pal = obp1
+					idx = 1
+				}
+				r, g, b := shadeP(idx, pal, ci)
+				if !bestFound || s.sx < bestX || (s.sx == bestX && s.index < bestIdx) {
+					bestR, bestG, bestB = r, g, b
+					bestX = s.sx
 					bestIdx = s.index
 					bestFound = true
 				}
 			}
 			if bestFound {
 				i := (y*m.w + x) * 4
-				m.fb[i+0] = bestGray
-				m.fb[i+1] = bestGray
-				m.fb[i+2] = bestGray
+				m.fb[i+0] = bestR
+				m.fb[i+1] = bestG
+				m.fb[i+2] = bestB
 				m.fb[i+3] = 0xFF
 			}
 		}

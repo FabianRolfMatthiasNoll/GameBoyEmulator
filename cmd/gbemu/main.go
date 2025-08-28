@@ -171,6 +171,9 @@ func main() {
 		if useCGB {
 			// Our CPU core doesn’t implement the full CGB boot ROM; simulate CGB post-boot instead.
 			m.ResetCGBPostBoot(false)
+		} else if m.WantCGBColors() {
+			// DMG ROM, but user wants CGB colors: run in CGB compatibility mode
+			m.ResetCGBPostBoot(true)
 		} else if len(boot) >= 0x100 {
 			m.ResetWithBoot()
 		} else {

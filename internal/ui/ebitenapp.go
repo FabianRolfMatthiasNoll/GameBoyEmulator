@@ -358,6 +358,10 @@ func (a *App) Update() error {
 								_ = a.m.LoadBattery(data)
 							}
 						}
+						// If user has CGB Colors toggled for a DMG ROM, restart into CGB compat now
+						if a.m.WantCGBColors() && !a.m.UseCGBBG() {
+							a.m.ResetCGBPostBoot(true)
+						}
 					} else {
 						a.toast("ROM load failed: " + err.Error())
 					}
@@ -378,8 +382,11 @@ func (a *App) Update() error {
 				a.menuMode = "main"
 			}
 		case "settings":
-			// Items: Scale, Audio, Audio Adaptive, Low-Latency, BG Renderer, ROMs Dir (editable), CGB BG (exp)
+			// Items: Scale, Audio, Audio Adaptive, Low-Latency, BG Renderer, ROMs Dir (editable), CGB Colors, (optional) Compat Palette
 			items := 7
+			if a.m != nil && a.m.IsCGBCompat() {
+				items = 8
+			}
 			if !a.editingROMDir { // normal navigation when not editing
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) && a.menuIdx > 0 {
 					a.menuIdx--
@@ -493,8 +500,28 @@ func (a *App) Update() error {
 			} else if a.menuIdx == 6 && !a.editingROMDir { // CGB Colors toggle
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) || inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
 					if a.m != nil {
-						a.m.SetUseCGBBG(!a.m.UseCGBBG())
+						turnOn := !a.m.WantCGBColors()
+						if turnOn {
+							// Enable CGB colors. If the ROM is DMG-only, enter CGB compatibility mode with a clean reset.
+							a.m.SetUseCGBBG(true)
+							if a.m.IsCGBCompat() {
+								a.m.ResetCGBPostBoot(true)
+							}
+						} else {
+							// Turn off: leave compat mode and return to DMG post-boot.
+							a.m.SetUseCGBBG(false)
+							a.m.ResetPostBoot()
+						}
 					}
+				}
+			} else if a.menuIdx == 7 && a.m != nil && a.m.IsCGBCompat() && !a.editingROMDir { // Compat Palette row
+				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) {
+					a.m.CycleCompatPalette(-1)
+					a.toast(fmt.Sprintf("Compat palette: %d", a.m.CurrentCompatPalette()))
+				}
+				if inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) || inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
+					a.m.CycleCompatPalette(+1)
+					a.toast(fmt.Sprintf("Compat palette: %d", a.m.CurrentCompatPalette()))
 				}
 			}
 			// back to main from settings when not editing
@@ -511,6 +538,18 @@ func (a *App) Update() error {
 	// Toggle stats overlay (F8)
 	if inpututil.IsKeyJustPressed(ebiten.KeyF8) {
 		a.showStats = !a.showStats
+	}
+
+	// In DMG-on-CGB compatibility mode, allow quick palette cycling with [ and ]
+	if a.m != nil && a.m.IsCGBCompat() {
+		if inpututil.IsKeyJustPressed(ebiten.KeyBracketLeft) {
+			a.m.CycleCompatPalette(-1)
+			a.toast(fmt.Sprintf("Compat palette: %d", a.m.CurrentCompatPalette()))
+		}
+		if inpututil.IsKeyJustPressed(ebiten.KeyBracketRight) {
+			a.m.CycleCompatPalette(+1)
+			a.toast(fmt.Sprintf("Compat palette: %d", a.m.CurrentCompatPalette()))
+		}
 	}
 
 	// Emulation pacing: run at ~59.7275 FPS using a time accumulator, decoupled from Ebiten's ~60Hz
@@ -651,11 +690,11 @@ func (s *apuStream) Read(p []byte) (int, error) {
 	}
 
 	// Prefer to read only what's currently buffered to avoid padding, with a short wait.
-	waitMs := 15 * time.Millisecond
+	waitDur := 15 * time.Millisecond
 	if s.lowLatency {
-		waitMs = 8 * time.Millisecond
+		waitDur = 8 * time.Millisecond
 	}
-	deadline := time.Now().Add(waitMs)
+	deadline := time.Now().Add(waitDur)
 	want := maxReq
 	if buf := s.m.APUBufferedStereo(); buf > 0 {
 		if buf < want {
@@ -915,7 +954,11 @@ func (a *App) Draw(screen *ebiten.Image) {
 				fmt.Sprintf("Low-Latency Audio: %s", map[bool]string{true: "On", false: "Off"}[a.cfg.AudioLowLatency]),
 				fmt.Sprintf("BG Renderer: %s", map[bool]string{true: "Fetcher", false: "Classic"}[a.cfg.UseFetcherBG]),
 				fmt.Sprintf("ROMs Dir: %s", a.truncateText(romDir, a.maxCharsForText(10)-11)),
-				fmt.Sprintf("CGB Colors: %s", map[bool]string{true: "On", false: "Off"}[a.m != nil && a.m.UseCGBBG()]),
+				fmt.Sprintf("CGB Colors: %s", map[bool]string{true: "On", false: "Off"}[a.m != nil && a.m.WantCGBColors()]),
+			}
+			// If in CGB compatibility mode, show current palette hint
+			if a.m != nil && a.m.IsCGBCompat() {
+				items = append(items, fmt.Sprintf("Compat Palette: %d  ([/]): cycle", a.m.CurrentCompatPalette()))
 			}
 			baseY := cursorY
 			maxRows := (144 - baseY) / 14
