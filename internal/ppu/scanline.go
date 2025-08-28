@@ -109,6 +109,10 @@ func ComposeSpriteLineExt(mem VRAMReader, sprites []Sprite, lineY int, bgci [160
 		if lineY < s.Y || lineY >= s.Y+height {
 			continue
 		}
+		// Quick reject if completely off-screen horizontally
+		if s.X >= 160 || s.X+7 < 0 {
+			continue
+		}
 		row := lineY - s.Y
 		// vertical flip
 		if (s.Attr & (1 << 6)) != 0 {
@@ -130,17 +134,23 @@ func ComposeSpriteLineExt(mem VRAMReader, sprites []Sprite, lineY int, bgci [160
 		base := uint16(0x8000) + uint16(tIndex)*16 + uint16(rowWithin)*2
 		lo := mem.Read(base)
 		hi := mem.Read(base + 1)
+		// Precompute color indices for the 8 pixels in this row (left to right)
+		var rowPix [8]byte
+		for b := 0; b < 8; b++ {
+			bit := 7 - byte(b)
+			rowPix[b] = ((hi>>bit)&1)<<1 | ((lo >> bit) & 1)
+		}
 		for col := 0; col < 8; col++ {
 			screenX := s.X + col
 			if screenX < 0 || screenX >= 160 {
 				continue
 			}
-			// horizontal flip
-			bit := 7 - byte(col)
+			// horizontal flip via index mirroring
+			idx := col
 			if (s.Attr & (1 << 5)) != 0 {
-				bit = byte(col)
+				idx = 7 - col
 			}
-			ci := ((hi>>bit)&1)<<1 | ((lo >> bit) & 1)
+			ci := rowPix[idx]
 			if ci == 0 {
 				continue
 			}
