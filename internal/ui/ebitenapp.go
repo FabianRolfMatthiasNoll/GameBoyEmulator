@@ -69,6 +69,15 @@ type App struct {
 	// toast feedback
 	toastMsg   string
 	toastUntil time.Time
+
+	// overlay skin
+	shellImg  *ebiten.Image
+	shellList []string
+	shellIdx  int
+
+	// current logical screen size
+	curW int
+	curH int
 }
 
 func NewApp(cfg Config, m *emu.Machine) *App {
@@ -78,6 +87,7 @@ func NewApp(cfg Config, m *emu.Machine) *App {
 	ebiten.SetWindowTitle(cfg.Title)
 	ebiten.SetWindowSize(160*cfg.Scale, 144*cfg.Scale)
 	a := &App{cfg: cfg, m: m}
+	a.curW, a.curH = 160, 144
 	a.lastTime = time.Now()
 	a.frameAcc = 0
 	a.turbo = 1
@@ -118,6 +128,19 @@ func NewApp(cfg Config, m *emu.Machine) *App {
 	// Propagate rendering config into emulator
 	if m != nil {
 		m.SetUseFetcherBG(a.cfg.UseFetcherBG)
+	}
+	// discover available skins and align selected index
+	a.shellList = a.findSkins()
+	a.shellIdx = 0
+	for i, p := range a.shellList {
+		if filepath.Clean(p) == filepath.Clean(a.cfg.ShellImage) {
+			a.shellIdx = i
+			break
+		}
+	}
+	if a.cfg.ShellOverlay {
+		a.loadShell()
+		a.applyWindowSize()
 	}
 	return a
 }
@@ -219,6 +242,17 @@ func (a *App) Update() error {
 	// Fullscreen toggle (F11)
 	if inpututil.IsKeyJustPressed(ebiten.KeyF11) {
 		ebiten.SetFullscreen(!ebiten.IsFullscreen())
+	}
+	// Quick toggle shell overlay (F10)
+	if inpututil.IsKeyJustPressed(ebiten.KeyF10) {
+		a.cfg.ShellOverlay = !a.cfg.ShellOverlay
+		if a.cfg.ShellOverlay {
+			a.loadShell()
+		}
+		a.applyWindowSize()
+		a.saveSettings()
+		state := map[bool]string{true: "On", false: "Off"}[a.cfg.ShellOverlay]
+		a.toast("Shell Overlay: " + state)
 	}
 	// Quick slots (1..4) and quick save/load (F5/F9)
 	// number keys 1..4 map to slots 1..4
@@ -359,7 +393,7 @@ func (a *App) Update() error {
 				// compute window
 				baseY := 28
 				_ = baseY // draw uses same baseline; keep logic consistent
-				maxRows := (144 - baseY) / 14
+				maxRows := (a.curH - baseY) / 14
 				if maxRows < 1 {
 					maxRows = 1
 				}
@@ -427,10 +461,21 @@ func (a *App) Update() error {
 				a.menuMode = "main"
 			}
 		case "settings":
-			// Items: Scale, Audio, Audio Adaptive, Low-Latency, BG Renderer, ROMs Dir (editable), CGB Colors, (optional) Compat Palette
-			items := 7
-			if a.m != nil && a.m.IsCGBCompat() {
-				items = 8
+			// Items order:
+			// 0 Scale
+			// 1 Audio
+			// 2 Audio Adaptive
+			// 3 Low-Latency
+			// 4 BG Renderer
+			// 5 ROMs Dir
+			// 6 CGB Colors
+			// 7 Compat Palette (if compat)
+			// 8 Shell Overlay
+			// 9 Shell Skin
+			hasCompat := a.m != nil && a.m.IsCGBCompat()
+			items := 9
+			if hasCompat {
+				items = 10
 			}
 			if !a.editingROMDir { // normal navigation when not editing
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) && a.menuIdx > 0 {
@@ -442,7 +487,7 @@ func (a *App) Update() error {
 				// maintain scroll window
 				title := "Settings (Up/Down select; Left/Right change; Enter: edit/apply; Backspace/Esc: back)"
 				baseY := 10 + 14*len(a.wrapText(title, a.maxCharsForText(10))) + 14
-				maxRows := (144 - baseY) / 14
+				maxRows := (a.curH - baseY) / 14
 				if maxRows < 1 {
 					maxRows = 1
 				}
@@ -457,13 +502,13 @@ func (a *App) Update() error {
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) {
 					if a.cfg.Scale > 1 {
 						a.cfg.Scale--
-						ebiten.SetWindowSize(160*a.cfg.Scale, 144*a.cfg.Scale)
+						a.applyWindowSize()
 					}
 				}
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) {
 					if a.cfg.Scale < 10 {
 						a.cfg.Scale++
-						ebiten.SetWindowSize(160*a.cfg.Scale, 144*a.cfg.Scale)
+						a.applyWindowSize()
 					}
 				}
 			} else if a.menuIdx == 1 && !a.editingROMDir { // Audio Output
@@ -559,7 +604,7 @@ func (a *App) Update() error {
 						}
 					}
 				}
-			} else if a.menuIdx == 7 && a.m != nil && a.m.IsCGBCompat() && !a.editingROMDir { // Compat Palette row
+			} else if a.menuIdx == 7 && hasCompat && !a.editingROMDir { // Compat Palette row
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) {
 					a.m.CycleCompatPalette(-1)
 					pid := a.m.CurrentCompatPalette()
@@ -578,6 +623,38 @@ func (a *App) Update() error {
 					if a.m.ROMPath() != "" {
 						a.cfg.PerROMCompatPalette[a.m.ROMPath()] = pid
 						a.saveSettings()
+					}
+				}
+			} else if a.menuIdx == 8 && !a.editingROMDir { // Shell Overlay toggle
+				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) || inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
+					a.cfg.ShellOverlay = !a.cfg.ShellOverlay
+					if a.cfg.ShellOverlay {
+						a.loadShell()
+					}
+					a.applyWindowSize()
+					a.saveSettings()
+				}
+			} else if a.menuIdx == 9 && !a.editingROMDir { // Shell Skin select
+				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) {
+					if len(a.shellList) > 0 {
+						a.shellIdx = (a.shellIdx - 1 + len(a.shellList)) % len(a.shellList)
+						a.cfg.ShellImage = a.shellList[a.shellIdx]
+						a.shellImg = nil // force reload
+						a.loadShell()
+						a.applyWindowSize()
+						a.saveSettings()
+						a.toast("Skin: " + filepath.Base(a.cfg.ShellImage))
+					}
+				}
+				if inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) || inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
+					if len(a.shellList) > 0 {
+						a.shellIdx = (a.shellIdx + 1) % len(a.shellList)
+						a.cfg.ShellImage = a.shellList[a.shellIdx]
+						a.shellImg = nil
+						a.loadShell()
+						a.applyWindowSize()
+						a.saveSettings()
+						a.toast("Skin: " + filepath.Base(a.cfg.ShellImage))
 					}
 				}
 			}
@@ -854,11 +931,33 @@ func (s *apuStream) Read(p []byte) (int, error) {
 }
 
 func (a *App) Draw(screen *ebiten.Image) {
+	// Optional shell overlay drawn first as background
+	if a.cfg.ShellOverlay {
+		if a.shellImg == nil {
+			a.loadShell()
+		}
+		if a.shellImg != nil {
+			screen.DrawImage(a.shellImg, nil)
+		}
+	}
+
+	// Draw the 160x144 game framebuffer; center it within current logical screen
+	oW, oH := screen.Bounds().Dx(), screen.Bounds().Dy()
 	if a.tex == nil {
 		a.tex = ebiten.NewImage(160, 144)
 	}
 	a.tex.WritePixels(a.m.Framebuffer())
-	screen.DrawImage(a.tex, nil)
+	var op ebiten.DrawImageOptions
+	dx := (oW - 160) / 2
+	dy := (oH - 144) / 2
+	if dx < 0 {
+		dx = 0
+	}
+	if dy < 0 {
+		dy = 0
+	}
+	op.GeoM.Translate(float64(dx), float64(dy))
+	screen.DrawImage(a.tex, &op)
 
 	// Stats overlay
 	if a.showStats {
@@ -883,7 +982,7 @@ func (a *App) Draw(screen *ebiten.Image) {
 	}
 
 	if a.showMenu {
-		overlay := ebiten.NewImage(160, 144)
+		overlay := ebiten.NewImage(oW, oH)
 		overlay.Fill(color.RGBA{0, 0, 0, 140})
 		screen.DrawImage(overlay, nil)
 		switch a.menuMode {
@@ -941,7 +1040,7 @@ func (a *App) Draw(screen *ebiten.Image) {
 				ebitenutil.DebugPrintAt(screen, "No ROMs found", 10, 40)
 			}
 			baseY := 40
-			maxRows := (144 - baseY) / 14
+			maxRows := (a.curH - baseY) / 14
 			if maxRows < 1 {
 				maxRows = 1
 			}
@@ -991,7 +1090,7 @@ func (a *App) Draw(screen *ebiten.Image) {
 				"Esc: Open/Close Menu",
 			}
 			baseY := cursorY + 4
-			maxRows := (144 - baseY) / 14
+			maxRows := (a.curH - baseY) / 14
 			if maxRows < 1 {
 				maxRows = 1
 			}
@@ -1042,9 +1141,10 @@ func (a *App) Draw(screen *ebiten.Image) {
 			if a.m != nil && a.m.IsCGBCompat() {
 				pid := a.m.CurrentCompatPalette()
 				items = append(items, fmt.Sprintf("Compat Palette: %d - %s  ([/]): cycle", pid, a.m.CompatPaletteName(pid)))
+				items = append(items, fmt.Sprintf("Shell Overlay: %s  (F10 toggles)", map[bool]string{true: "On", false: "Off"}[a.cfg.ShellOverlay]))
 			}
 			baseY := cursorY
-			maxRows := (144 - baseY) / 14
+			maxRows := (a.curH - baseY) / 14
 			if maxRows < 1 {
 				maxRows = 1
 			}
@@ -1195,12 +1295,26 @@ func (a *App) loadSlot(slot int) error {
 	return a.m.LoadStateFromFile(path)
 }
 
-func (a *App) Layout(outW, outH int) (int, int) { return 160, 144 }
+func (a *App) Layout(outW, outH int) (int, int) {
+	if a != nil && a.cfg.ShellOverlay {
+		if a.shellImg == nil {
+			a.loadShell()
+		}
+		if a.shellImg != nil {
+			if w, h := a.shellImg.Size(); w > 0 && h > 0 {
+				a.curW, a.curH = w, h
+				return w, h
+			}
+		}
+	}
+	a.curW, a.curH = 160, 144
+	return 160, 144
+}
 
 // maxCharsForText estimates how many characters fit on a line starting at left margin x.
 // This uses a conservative ~6px per character for the debug font.
 func (a *App) maxCharsForText(left int) int {
-	w := 160 - left - 4
+	w := a.curW - left - 4
 	if w < 6 {
 		return 1
 	}
@@ -1271,4 +1385,89 @@ func (a *App) saveScreenshot() error {
 	}
 	defer f.Close()
 	return png.Encode(f, img)
+}
+
+// applyWindowSize recalculates the window size depending on overlay presence.
+// When overlay is enabled and larger than 160x144, the window scales the overlay by cfg.Scale; otherwise scales the game area.
+func (a *App) applyWindowSize() {
+	if a == nil {
+		return
+	}
+	baseW, baseH := 160, 144
+	if a.cfg.ShellOverlay && a.shellImg != nil {
+		w, h := a.shellImg.Size()
+		if w > 0 && h > 0 {
+			baseW, baseH = w, h
+		}
+	}
+	ebiten.SetWindowSize(baseW*a.cfg.Scale, baseH*a.cfg.Scale)
+}
+
+// findSkins searches common skin folders for .png files and returns absolute paths.
+func (a *App) findSkins() []string {
+	var out []string
+	addPngs := func(dir string) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := strings.ToLower(e.Name())
+			if strings.HasSuffix(name, ".png") {
+				out = append(out, filepath.Join(dir, e.Name()))
+			}
+		}
+	}
+	exe, _ := os.Executable()
+	exedir := filepath.Dir(exe)
+	// default skins location in repo
+	addPngs(filepath.Join(exedir, "assets", "skins"))
+	// also try CWD-relative
+	addPngs(filepath.Join("assets", "skins"))
+	// De-dup
+	sort.Strings(out)
+	uniq := out[:0]
+	seen := map[string]bool{}
+	for _, p := range out {
+		cp := filepath.Clean(p)
+		if seen[cp] {
+			continue
+		}
+		seen[cp] = true
+		uniq = append(uniq, cp)
+	}
+	return uniq
+}
+
+// loadShell loads the configured shell image into memory and adjusts window size.
+func (a *App) loadShell() {
+	a.shellImg = nil
+	openAndDecode := func(path string) (*ebiten.Image, error) {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		img, err := png.Decode(f)
+		if err != nil {
+			return nil, err
+		}
+		return ebiten.NewImageFromImage(img), nil
+	}
+	// Try as-is (relative to CWD or absolute)
+	if img, err := openAndDecode(a.cfg.ShellImage); err == nil {
+		a.shellImg = img
+		return
+	}
+	// Fallback to exe-relative
+	if exe, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(exe), a.cfg.ShellImage)
+		if img, err2 := openAndDecode(p); err2 == nil {
+			a.shellImg = img
+			return
+		}
+	}
 }

@@ -11,6 +11,9 @@ type Config struct {
 	AudioLowLatency bool   // hard-cap buffering for minimal latency
 	ROMsDir         string // directory to browse for ROMs
 	UseFetcherBG    bool   // render BG via fetcher/FIFO
+	// Visual overlay skin
+	ShellOverlay bool   // draw an alpha-blended overlay image over the game view
+	ShellImage   string // path to the overlay image (PNG)
 	// Per-ROM preferences
 	PerROMCompatPalette map[string]int // map of ROM path -> compat palette ID
 	// Later: fullscreen, vsync toggle, key mapping, etc.
@@ -32,5 +35,9 @@ func (c *Config) Defaults() {
 	}
 	if c.PerROMCompatPalette == nil {
 		c.PerROMCompatPalette = make(map[string]int)
+	}
+	// Default overlay path, disabled by default
+	if c.ShellImage == "" {
+		c.ShellImage = "assets/skins/gbc_overlay.png"
 	}
 }
