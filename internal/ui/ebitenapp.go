@@ -112,14 +112,17 @@ func (a *App) SaveSettings() { a.saveSettings() }
 func (a *App) Update() error {
 	// Lazy-create audio player on first update to avoid startup blocking before the window appears
 	if a.audioPlayer == nil {
-		for i := 0; i < 12; i++ {
-			a.m.StepFrame()
-		}
-		a.audioSrc = &apuStream{m: a.m, mono: !a.cfg.AudioStereo, muted: &a.audioMuted}
+		// Safe init: create audio player but start muted initially to avoid first-frame stalls
+		a.audioMuted = true
+		a.m.APUClearAudioLatency()
+		a.audioSrc = &apuStream{m: a.m, mono: !a.cfg.AudioStereo, muted: &a.audioMuted, lowLatency: a.cfg.AudioLowLatency}
 		if p, err := a.audioCtx.NewPlayer(a.audioSrc); err == nil {
 			a.audioPlayer = p
+			a.applyPlayerBufferSize()
 			a.audioPlayer.Play()
 		}
+		// Unmute after a few update ticks once frames are flowing
+		// (we toggle below when target buffer has some frames)
 	}
 	// Keyboard → Game Boy buttons (disabled when menu is shown)
 	if !a.showMenu {
@@ -157,6 +160,7 @@ func (a *App) Update() error {
 		a.paused = !a.paused
 	}
 	// Fast-forward (Tab)
+	prevFast := a.fast
 	a.fast = ebiten.IsKeyPressed(ebiten.KeyTab)
 	// Resets
 	if inpututil.IsKeyJustPressed(ebiten.KeyR) {
@@ -224,6 +228,24 @@ func (a *App) Update() error {
 		a.audioMuted = muted
 		a.lastTime = time.Now()
 		a.frameAcc = 0
+		// When (un)muting, drop buffered audio to avoid stale playback
+		if a.m != nil {
+			a.m.APUClearAudioLatency()
+		}
+	}
+
+	// If entering fast-forward, cap audio buffer so it doesn't lag; on exit, clear to resync
+	if a.m != nil && prevFast != a.fast {
+		if a.fast {
+			// Trim to ~40ms at 48kHz (~1920 frames)
+			a.m.APUCapBufferedStereo(1920)
+			// tighten player buffer during fast-forward
+			a.applyPlayerBufferSize()
+		} else {
+			// Leaving fast-forward: drop buffered audio to resync with video/input
+			a.m.APUClearAudioLatency()
+			a.applyPlayerBufferSize()
+		}
 	}
 
 	if a.showMenu {
@@ -354,8 +376,8 @@ func (a *App) Update() error {
 				a.menuMode = "main"
 			}
 		case "settings":
-			// Items: Scale, Audio, Audio Adaptive, ROMs Dir (editable)
-			items := 5
+			// Items: Scale, Audio, Audio Adaptive, Low-Latency, BG Renderer, ROMs Dir (editable)
+			items := 6
 			if !a.editingROMDir { // normal navigation when not editing
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) && a.menuIdx > 0 {
 					a.menuIdx--
@@ -387,9 +409,10 @@ func (a *App) Update() error {
 					for i := 0; i < 12; i++ {
 						a.m.StepFrame()
 					}
-					a.audioSrc = &apuStream{m: a.m, mono: !a.cfg.AudioStereo, muted: &a.audioMuted}
+					a.audioSrc = &apuStream{m: a.m, mono: !a.cfg.AudioStereo, muted: &a.audioMuted, lowLatency: a.cfg.AudioLowLatency}
 					if p, err := a.audioCtx.NewPlayer(a.audioSrc); err == nil {
 						a.audioPlayer = p
+						a.applyPlayerBufferSize()
 						a.audioPlayer.Play()
 					}
 				}
@@ -397,7 +420,20 @@ func (a *App) Update() error {
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) {
 					a.cfg.AudioAdaptive = !a.cfg.AudioAdaptive
 				}
-			} else if a.menuIdx == 3 && !a.editingROMDir { // BG Renderer
+			} else if a.menuIdx == 3 && !a.editingROMDir { // Low-Latency Audio
+				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) || inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
+					a.cfg.AudioLowLatency = !a.cfg.AudioLowLatency
+					a.saveSettings()
+					// When turning on low-latency, immediately trim buffered audio
+					if a.m != nil && a.cfg.AudioLowLatency {
+						a.m.APUCapBufferedStereo(1440) // ~30ms
+					}
+					if a.audioSrc != nil {
+						a.audioSrc.lowLatency = a.cfg.AudioLowLatency
+					}
+					a.applyPlayerBufferSize()
+				}
+			} else if a.menuIdx == 4 && !a.editingROMDir { // BG Renderer
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) || inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
 					a.cfg.UseFetcherBG = !a.cfg.UseFetcherBG
 					if a.m != nil {
@@ -405,7 +441,7 @@ func (a *App) Update() error {
 					}
 					a.saveSettings()
 				}
-			} else if a.menuIdx == 4 { // ROMs Dir edit mode
+			} else if a.menuIdx == 5 { // ROMs Dir edit mode
 				if !a.editingROMDir {
 					if inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
 						a.editingROMDir = true
@@ -478,36 +514,58 @@ func (a *App) Update() error {
 			steps++
 		}
 		// Adaptive audio buffer target: raise on underruns, decay slowly when stable
-		if a.cfg.AudioAdaptive && a.audioSrc != nil {
+		if a.cfg.AudioAdaptive && a.audioSrc != nil && !a.cfg.AudioLowLatency {
+			// Clamp upper bound to ~200ms to avoid large inherent lag
+			maxFrames := 48000 * 200 / 1000 // ~9600
+			if a.targetFrames > maxFrames {
+				a.targetFrames = maxFrames
+			}
 			if a.audioSrc.underruns > 0 {
 				a.stableTicks = 0
-				if a.targetFrames < 10500 {
-					a.targetFrames += 600
+				if a.targetFrames < maxFrames {
+					a.targetFrames += 800
+					if a.targetFrames > maxFrames {
+						a.targetFrames = maxFrames
+					}
 				}
 				a.audioSrc.underruns = 0
 			} else {
 				a.stableTicks++
-				if a.stableTicks > 120 {
-					if a.targetFrames > 5400 {
-						a.targetFrames -= 300
+				if a.stableTicks > 90 { // decay a bit faster
+					minFrames := 48000 * 40 / 1000 // ~40ms
+					if a.targetFrames > minFrames {
+						a.targetFrames -= 400
+						if a.targetFrames < minFrames {
+							a.targetFrames = minFrames
+						}
 					}
 					a.stableTicks = 0
 				}
 			}
 		}
-		// Audio buffer top-up toward current target
+		// Audio buffer target and trimming
 		target := a.targetFrames
+		// Low-latency mode enforces a small, fixed target and trims any excess
+		if a.cfg.AudioLowLatency {
+			target = 48000 * 35 / 1000 // ~35ms
+		}
+		// When fast-forwarding, keep latency small by lowering target further
+		if a.fast {
+			ffTarget := 48000 * 30 / 1000 // ~30ms while fast-forwarding
+			if target > ffTarget {
+				target = ffTarget
+			}
+		}
 		buffered := a.m.APUBufferedStereo()
-		if buffered < target {
-			deficit := target - buffered
-			// ~samples per GB frame at 48kHz: ~803
-			const spf = 803
-			framesNeeded := (deficit + spf - 1) / spf
-			if framesNeeded > 8 {
-				framesNeeded = 8
-			} // small cap per tick
-			for i := 0; i < framesNeeded; i++ {
-				a.m.StepFrame()
+		// If we started muted and we have some audio buffered, unmute now
+		if a.audioMuted && buffered > 1024 { // ~20ms
+			a.audioMuted = false
+		}
+		// Trim if buffer runs away while in low-latency mode
+		if a.cfg.AudioLowLatency {
+			ceiling := target + 48000*10/1000 // target +10ms
+			if buffered > ceiling {
+				a.m.APUCapBufferedStereo(ceiling)
 			}
 		}
 	}
@@ -515,12 +573,28 @@ func (a *App) Update() error {
 	return nil
 }
 
+// applyPlayerBufferSize sets the audio player's internal buffer to a small size for low latency.
+// Ebiten exposes Player.SetBufferSize; we pick:
+// - ~20ms in low-latency (or during fast-forward)
+// - ~40ms otherwise
+func (a *App) applyPlayerBufferSize() {
+	if a.audioPlayer == nil {
+		return
+	}
+	bufMs := 40
+	if a.cfg.AudioLowLatency || a.fast {
+		bufMs = 20
+	}
+	a.audioPlayer.SetBufferSize(time.Duration(bufMs) * time.Millisecond)
+}
+
 // apuStream implements io.Reader by pulling PCM samples from the emulator APU and
 // converting them to 16-bit little-endian stereo frames.
 type apuStream struct {
-	m     *emu.Machine
-	mono  bool
-	muted *bool
+	m          *emu.Machine
+	mono       bool
+	muted      *bool
+	lowLatency bool
 	// stats
 	underruns  int
 	lastWant   int
@@ -545,22 +619,64 @@ func (s *apuStream) Read(p []byte) (int, error) {
 		time.Sleep(5 * time.Millisecond)
 		return len(p), nil
 	}
-	// Each frame is 4 bytes (stereo int16). Block until the buffer is filled.
-	want := len(p) / 4
-	filled := 0
-	// Short, responsive wait loop: return what we have instead of padding
-	deadline := time.Now().Add(15 * time.Millisecond)
-	for filled < want {
-		frames := s.m.APUPullStereo(want - filled)
-		if len(frames) == 0 {
-			if time.Now().After(deadline) {
+	// Each frame is 4 bytes (stereo int16). Limit per-read to a small cap to avoid over-buffering.
+	maxReq := len(p) / 4
+	capFrames := 2048 // ~42.7ms at 48kHz
+	if s.lowLatency {
+		capFrames = 1024 // ~21.3ms
+	}
+	if maxReq > capFrames {
+		maxReq = capFrames
+	}
+
+	// Prefer to read only what's currently buffered to avoid padding, with a short wait.
+	waitMs := 15 * time.Millisecond
+	if s.lowLatency {
+		waitMs = 8 * time.Millisecond
+	}
+	deadline := time.Now().Add(waitMs)
+	want := maxReq
+	if buf := s.m.APUBufferedStereo(); buf > 0 {
+		if buf < want {
+			want = buf
+		}
+	} else {
+		// No data buffered yet: wait briefly for some to arrive
+		for time.Now().Before(deadline) {
+			if b := s.m.APUBufferedStereo(); b > 0 {
+				want = b
+				if want > maxReq {
+					want = maxReq
+				}
 				break
 			}
 			time.Sleep(1 * time.Millisecond)
-			continue
 		}
-		// Convert pulled frames (interleaved) depending on mode
-		i := filled * 4
+	}
+	if want <= 0 { // still nothing: return a minimal silence chunk (counts as underrun)
+		silenceFrames := 256
+		if silenceFrames > maxReq {
+			silenceFrames = maxReq
+		}
+		for i := 0; i < silenceFrames*4 && i+3 < len(p); i += 4 {
+			binary.LittleEndian.PutUint16(p[i:], 0)
+			binary.LittleEndian.PutUint16(p[i+2:], 0)
+		}
+		s.underruns++
+		s.lastWant = silenceFrames
+		s.lastPulled = silenceFrames
+		return silenceFrames * 4, nil
+	}
+
+	// Pull and convert exactly 'want' frames. Do not pad beyond what we pulled.
+	pulled := 0
+	i := 0
+	for pulled < want {
+		frames := s.m.APUPullStereo(want - pulled)
+		if len(frames) == 0 {
+			break
+		}
+		// Convert pulled frames
 		for j := 0; j+1 < len(frames) && i+3 < len(p); j += 2 {
 			l := int16(frames[j])
 			r := int16(frames[j+1])
@@ -573,25 +689,27 @@ func (s *apuStream) Read(p []byte) (int, error) {
 				binary.LittleEndian.PutUint16(p[i+2:], uint16(r))
 			}
 			i += 4
-			filled++
+			pulled++
 		}
 	}
-	if filled < want {
+	if pulled == 0 {
+		// Fallback: return a tiny silence chunk to avoid stalling and count underrun
+		silenceFrames := 128
+		if silenceFrames > maxReq {
+			silenceFrames = maxReq
+		}
+		for k := 0; k < silenceFrames*4 && k+3 < len(p); k += 4 {
+			binary.LittleEndian.PutUint16(p[k:], 0)
+			binary.LittleEndian.PutUint16(p[k+2:], 0)
+		}
 		s.underruns++
-		// pad remaining with silence to avoid stalling
-		i := filled * 4
-		for ; filled < want && i+3 < len(p); filled++ {
-			binary.LittleEndian.PutUint16(p[i:], 0)
-			binary.LittleEndian.PutUint16(p[i+2:], 0)
-			i += 4
-		}
-		s.lastWant = want
-		s.lastPulled = filled
-		return want * 4, nil
+		s.lastWant = silenceFrames
+		s.lastPulled = silenceFrames
+		return silenceFrames * 4, nil
 	}
-	s.lastWant = want
-	s.lastPulled = filled
-	return want * 4, nil
+	s.lastWant = pulled
+	s.lastPulled = pulled
+	return pulled * 4, nil
 }
 
 func (a *App) Draw(screen *ebiten.Image) {
@@ -773,6 +891,7 @@ func (a *App) Draw(screen *ebiten.Image) {
 				fmt.Sprintf("Scale: %dx", a.cfg.Scale),
 				fmt.Sprintf("Audio: %s", map[bool]string{true: "Stereo", false: "Mono"}[a.cfg.AudioStereo]),
 				fmt.Sprintf("Audio Adaptive: %s", map[bool]string{true: "On", false: "Off"}[a.cfg.AudioAdaptive]),
+				fmt.Sprintf("Low-Latency Audio: %s", map[bool]string{true: "On", false: "Off"}[a.cfg.AudioLowLatency]),
 				fmt.Sprintf("BG Renderer: %s", map[bool]string{true: "Fetcher", false: "Classic"}[a.cfg.UseFetcherBG]),
 				fmt.Sprintf("ROMs Dir: %s", a.truncateText(romDir, a.maxCharsForText(10)-11)),
 			}
@@ -870,6 +989,7 @@ func loadSettings(override Config) Config {
 	}
 	cfg.AudioStereo = override.AudioStereo || cfg.AudioStereo
 	cfg.AudioAdaptive = override.AudioAdaptive || cfg.AudioAdaptive
+	cfg.AudioLowLatency = override.AudioLowLatency || cfg.AudioLowLatency
 	// boolean override for UseFetcherBG if explicitly set true via code or defaults file
 	if override.UseFetcherBG {
 		cfg.UseFetcherBG = true

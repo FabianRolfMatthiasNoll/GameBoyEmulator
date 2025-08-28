@@ -251,6 +251,22 @@ func (m *Machine) APUBufferedStereo() int {
 	return m.bus.APU().StereoAvailable()
 }
 
+// APUClearAudioLatency drops all buffered stereo frames to re-sync audio with video.
+func (m *Machine) APUClearAudioLatency() {
+	if m == nil || m.bus == nil || m.bus.APU() == nil {
+		return
+	}
+	m.bus.APU().ClearStereoBuffer()
+}
+
+// APUCapBufferedStereo trims the buffered frames to at most target frames.
+func (m *Machine) APUCapBufferedStereo(target int) {
+	if m == nil || m.bus == nil || m.bus.APU() == nil {
+		return
+	}
+	m.bus.APU().TrimStereoTo(target)
+}
+
 // --- Save/Load state ---
 type machineState struct {
 	Bus []byte

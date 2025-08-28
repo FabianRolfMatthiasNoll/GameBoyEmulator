@@ -881,6 +881,35 @@ func (a *APU) StereoAvailable() int {
 	return (len(a.sL) - a.sTail) + a.sHead
 }
 
+// ClearStereoBuffer discards all buffered stereo frames to drop output latency.
+func (a *APU) ClearStereoBuffer() {
+	a.mu.Lock()
+	a.sTail = a.sHead
+	a.mu.Unlock()
+}
+
+// TrimStereoTo keeps at most target frames in the stereo buffer by discarding the oldest frames.
+func (a *APU) TrimStereoTo(target int) {
+	if target < 0 {
+		target = 0
+	}
+	a.mu.Lock()
+	avail := 0
+	if a.sHead >= a.sTail {
+		avail = a.sHead - a.sTail
+	} else {
+		avail = (len(a.sL) - a.sTail) + a.sHead
+	}
+	if avail > target {
+		// Set tail such that exactly 'target' remain ending at head
+		newTail := a.sHead - target
+		mask := len(a.sL) - 1
+		newTail &= mask
+		a.sTail = newTail
+	}
+	a.mu.Unlock()
+}
+
 func (a *APU) pushSample(s int16) {
 	a.mu.Lock()
 	next := (a.bufHead + 1) & (len(a.buf) - 1)

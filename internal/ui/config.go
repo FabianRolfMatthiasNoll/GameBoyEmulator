@@ -6,10 +6,11 @@ type Config struct {
 	Scale       int    // integer upscaling factor
 	AudioStereo bool   // if true, output true stereo; if false, fold to mono
 	// Audio buffering
-	AudioAdaptive bool   // adaptive target on underrun
-	AudioBufferMs int    // initial desired buffer in ms (approx)
-	ROMsDir       string // directory to browse for ROMs
-	UseFetcherBG  bool   // render BG via fetcher/FIFO
+	AudioAdaptive   bool   // adaptive target on underrun
+	AudioBufferMs   int    // initial desired buffer in ms (approx)
+	AudioLowLatency bool   // hard-cap buffering for minimal latency
+	ROMsDir         string // directory to browse for ROMs
+	UseFetcherBG    bool   // render BG via fetcher/FIFO
 	// Later: fullscreen, vsync toggle, key mapping, etc.
 }
 
@@ -22,7 +23,7 @@ func (c *Config) Defaults() {
 		c.Scale = 3
 	}
 	if c.AudioBufferMs <= 0 {
-		c.AudioBufferMs = 125
+		c.AudioBufferMs = 60 // lower baseline to reduce perceived latency
 	}
 	if c.ROMsDir == "" {
 		c.ROMsDir = "roms"
