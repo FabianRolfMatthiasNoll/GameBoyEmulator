@@ -11,6 +11,8 @@ type Config struct {
 	AudioLowLatency bool   // hard-cap buffering for minimal latency
 	ROMsDir         string // directory to browse for ROMs
 	UseFetcherBG    bool   // render BG via fetcher/FIFO
+	// Per-ROM preferences
+	PerROMCompatPalette map[string]int // map of ROM path -> compat palette ID
 	// Later: fullscreen, vsync toggle, key mapping, etc.
 }
 
@@ -27,5 +29,8 @@ func (c *Config) Defaults() {
 	}
 	if c.ROMsDir == "" {
 		c.ROMsDir = "roms"
+	}
+	if c.PerROMCompatPalette == nil {
+		c.PerROMCompatPalette = make(map[string]int)
 	}
 }

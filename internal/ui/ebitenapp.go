@@ -362,6 +362,12 @@ func (a *App) Update() error {
 						if a.m.WantCGBColors() && !a.m.UseCGBBG() {
 							a.m.ResetCGBPostBoot(true)
 						}
+						// Apply saved per-ROM palette preference, if any
+						if a.m.IsCGBCompat() && a.cfg.PerROMCompatPalette != nil {
+							if pid, ok := a.cfg.PerROMCompatPalette[path]; ok {
+								a.m.SetCompatPalette(pid)
+							}
+						}
 					} else {
 						a.toast("ROM load failed: " + err.Error())
 					}
@@ -517,11 +523,23 @@ func (a *App) Update() error {
 			} else if a.menuIdx == 7 && a.m != nil && a.m.IsCGBCompat() && !a.editingROMDir { // Compat Palette row
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) {
 					a.m.CycleCompatPalette(-1)
-					a.toast(fmt.Sprintf("Compat palette: %d", a.m.CurrentCompatPalette()))
+					pid := a.m.CurrentCompatPalette()
+					a.toast(fmt.Sprintf("Compat palette: %d - %s", pid, a.m.CompatPaletteName(pid)))
+					// persist per-ROM palette
+					if a.m.ROMPath() != "" {
+						a.cfg.PerROMCompatPalette[a.m.ROMPath()] = pid
+						a.saveSettings()
+					}
 				}
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) || inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
 					a.m.CycleCompatPalette(+1)
-					a.toast(fmt.Sprintf("Compat palette: %d", a.m.CurrentCompatPalette()))
+					pid := a.m.CurrentCompatPalette()
+					a.toast(fmt.Sprintf("Compat palette: %d - %s", pid, a.m.CompatPaletteName(pid)))
+					// persist per-ROM palette
+					if a.m.ROMPath() != "" {
+						a.cfg.PerROMCompatPalette[a.m.ROMPath()] = pid
+						a.saveSettings()
+					}
 				}
 			}
 			// back to main from settings when not editing
@@ -544,11 +562,21 @@ func (a *App) Update() error {
 	if a.m != nil && a.m.IsCGBCompat() {
 		if inpututil.IsKeyJustPressed(ebiten.KeyBracketLeft) {
 			a.m.CycleCompatPalette(-1)
-			a.toast(fmt.Sprintf("Compat palette: %d", a.m.CurrentCompatPalette()))
+			pid := a.m.CurrentCompatPalette()
+			a.toast(fmt.Sprintf("Compat palette: %d - %s", pid, a.m.CompatPaletteName(pid)))
+			if a.m.ROMPath() != "" {
+				a.cfg.PerROMCompatPalette[a.m.ROMPath()] = pid
+				a.saveSettings()
+			}
 		}
 		if inpututil.IsKeyJustPressed(ebiten.KeyBracketRight) {
 			a.m.CycleCompatPalette(+1)
-			a.toast(fmt.Sprintf("Compat palette: %d", a.m.CurrentCompatPalette()))
+			pid := a.m.CurrentCompatPalette()
+			a.toast(fmt.Sprintf("Compat palette: %d - %s", pid, a.m.CompatPaletteName(pid)))
+			if a.m.ROMPath() != "" {
+				a.cfg.PerROMCompatPalette[a.m.ROMPath()] = pid
+				a.saveSettings()
+			}
 		}
 	}
 
@@ -956,9 +984,10 @@ func (a *App) Draw(screen *ebiten.Image) {
 				fmt.Sprintf("ROMs Dir: %s", a.truncateText(romDir, a.maxCharsForText(10)-11)),
 				fmt.Sprintf("CGB Colors: %s", map[bool]string{true: "On", false: "Off"}[a.m != nil && a.m.WantCGBColors()]),
 			}
-			// If in CGB compatibility mode, show current palette hint
+			// If in CGB compatibility mode, show current palette hint with name
 			if a.m != nil && a.m.IsCGBCompat() {
-				items = append(items, fmt.Sprintf("Compat Palette: %d  ([/]): cycle", a.m.CurrentCompatPalette()))
+				pid := a.m.CurrentCompatPalette()
+				items = append(items, fmt.Sprintf("Compat Palette: %d - %s  ([/]): cycle", pid, a.m.CompatPaletteName(pid)))
 			}
 			baseY := cursorY
 			maxRows := (144 - baseY) / 14

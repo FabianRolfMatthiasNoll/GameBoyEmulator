@@ -39,6 +39,9 @@ type Machine struct {
 	cgbCompatID int
 }
 
+// Human-friendly names for the curated DMG-on-CGB compatibility palettes.
+var cgbCompatSetNames = []string{"Green", "Sepia", "Blue", "Red", "Pastel", "Gray"}
+
 func New(cfg Config) *Machine {
 	return &Machine{
 		cfg: cfg, w: 160, h: 144,
@@ -466,8 +469,7 @@ func (m *Machine) CycleCompatPalette(delta int) {
 	if !m.cgbCompat {
 		return
 	}
-	// We know we defined 6 sets above; keep wrap simple. If definition changes, wrap after seeding once.
-	const total = 6
+	total := len(cgbCompatSetNames)
 	id := m.cgbCompatID + delta
 	for id < 0 {
 		id += total
@@ -476,6 +478,23 @@ func (m *Machine) CycleCompatPalette(delta int) {
 	m.cgbCompatID = id
 	m.seedCGBCompatPalettesID(id)
 }
+
+// CompatPaletteName returns a friendly name for the given compat palette ID.
+func (m *Machine) CompatPaletteName(id int) string {
+	if id < 0 {
+		id = 0
+	}
+	if len(cgbCompatSetNames) == 0 {
+		return ""
+	}
+	if id >= len(cgbCompatSetNames) {
+		id = id % len(cgbCompatSetNames)
+	}
+	return cgbCompatSetNames[id]
+}
+
+// CompatPaletteCount returns the number of available compat palettes.
+func (m *Machine) CompatPaletteCount() int { return len(cgbCompatSetNames) }
 
 // computeCompatPaletteIDFromROM approximates the CGB boot's palette ID selection for DMG games.
 // For now, use a simple heuristic based on Nintendo licensee and title checksum, mapping into 0..5.
