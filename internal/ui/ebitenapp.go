@@ -623,6 +623,10 @@ const crtShaderSrc = `
 //kage:unit pixels
 package main
 
+func mod(a, b float) float {
+	return a - b*floor(a/b)
+}
+
 func Fragment(position vec4, srcPos vec2, color vec4) vec4 {
 	c := imageSrc0At(srcPos)
 	// scanlines every other row
@@ -663,24 +667,22 @@ const dotShaderSrc = `
 //kage:unit pixels
 package main
 
+func mod(a, b float) float { return a - b*floor(a/b) }
+
 func Fragment(position vec4, srcPos vec2, color vec4) vec4 {
 	c := imageSrc0At(srcPos)
-	// Fractional position within the pixel
-	// (avoid fract() for portability)
-	fx := srcPos.x - floor(srcPos.x)
-	fy := srcPos.y - floor(srcPos.y)
-	p := vec2(fx, fy)
-	// Circular dot mask centered at 0.5 with soft edge
-	d := distance(p, vec2(0.5, 0.5))
-	// Approximate smoothstep(0.6, 0.45, d)
-	t := (0.55 - d) / 0.15
-	if t < 0.0 { t = 0.0 }
-	if t > 1.0 { t = 1.0 }
-	mask := t
-	// light cross-bleed to neighboring pixels
+	// 2x2 Bayer-ish dither mask based on pixel indices
+	ix := floor(srcPos.x)
+	iy := floor(srcPos.y)
+	parity := mod(ix+iy, 2.0)
+	mask := 1.0
+	if parity == 0.0 {
+		mask = 0.85 // darken every other pixel to simulate dot pattern
+	}
+	// neighbor bleed for a bit of diffusion
 	nb := (imageSrc0At(srcPos + vec2(1.0,0.0)).rgb + imageSrc0At(srcPos + vec2(-1.0,0.0)).rgb +
 		   imageSrc0At(srcPos + vec2(0.0,1.0)).rgb + imageSrc0At(srcPos + vec2(0.0,-1.0)).rgb) / 4.0
-	rgb := mix(c.rgb, nb, 0.12) * mask
+	rgb := mix(c.rgb, nb, 0.10) * mask
 	return vec4(rgb, c.a)
 }
 `
