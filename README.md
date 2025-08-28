@@ -44,8 +44,9 @@ go run ./cmd/gbemu -rom path\to\game.gb
   - D-Pad: Arrow keys
   - A/B: Z/X
   - Start/Select: Enter/Right Shift
-  - Menu: Tab; Save state: F5; Load state: F9; Screenshot: F12
+  - Menu: Esc; Save state: F5; Load state: F9; Screenshot: F12
   - Palette cycle (DMG-on-CGB): [ and ]
+  - Speed: Tab; Increase: F7; Decrease: F6
 
 - Settings (in-app): scale, audio (stereo/mono), low-latency audio, BG renderer, ROMs directory, CGB Colors toggle, compat palette.
 

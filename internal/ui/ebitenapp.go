@@ -22,11 +22,15 @@ import (
 )
 
 type App struct {
-	cfg    Config
-	m      *emu.Machine
-	tex    *ebiten.Image
-	paused bool
-	fast   bool
+	cfg     Config
+	m       *emu.Machine
+	tex     *ebiten.Image
+	paused  bool
+	fast    bool
+	turbo   int  // turbo speed multiplier (1=off)
+	skipOn  bool // whether to skip rendering frames
+	skipN   int  // render 1 of (skipN+1) frames
+	skipCtr int  // counter for frame skip
 	// timing
 	lastTime   time.Time
 	frameAcc   float64 // accumulated fractional frames
@@ -76,6 +80,10 @@ func NewApp(cfg Config, m *emu.Machine) *App {
 	a := &App{cfg: cfg, m: m}
 	a.lastTime = time.Now()
 	a.frameAcc = 0
+	a.turbo = 1
+	a.skipOn = false
+	a.skipN = 0
+	a.skipCtr = 0
 	// Init audio at 48kHz to match APU
 	a.audioCtx = audio.NewContext(48000)
 	// Configure adaptive buffering and initial target
@@ -172,6 +180,23 @@ func (a *App) Update() error {
 	// Fast-forward (Tab)
 	prevFast := a.fast
 	a.fast = ebiten.IsKeyPressed(ebiten.KeyTab)
+	// Turbo controls: F6/F7 adjust multiplier; F4 toggles frame-skip
+	if inpututil.IsKeyJustPressed(ebiten.KeyF6) {
+		if a.turbo > 1 {
+			a.turbo--
+		}
+		a.toast(fmt.Sprintf("Turbo: x%d", a.turbo))
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyF7) {
+		if a.turbo < 10 {
+			a.turbo++
+		}
+		a.toast(fmt.Sprintf("Turbo: x%d", a.turbo))
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyF4) {
+		a.skipOn = !a.skipOn
+		a.toast(fmt.Sprintf("Frame skip: %v", map[bool]string{true: "On", false: "Off"}[a.skipOn]))
+	}
 	// Resets
 	if inpututil.IsKeyJustPressed(ebiten.KeyR) {
 		a.m.ResetPostBoot()
@@ -605,13 +630,27 @@ func (a *App) Update() error {
 		gbFps := 4194304.0 / 70224.0 // ~59.7275
 		speed := 1.0
 		if a.fast {
-			speed = 5.0
+			speed = float64(max(2, a.turbo))
 		}
 		a.frameAcc += dt * gbFps * speed
 		// Step whole frames
 		steps := 0
 		for a.frameAcc >= 1.0 && steps < 10 { // cap to avoid spiral of death
-			a.m.StepFrame()
+			// Optional frame skip: advance emulation without rendering for skipped frames
+			doRender := true
+			if a.skipOn {
+				if a.skipCtr < a.skipN {
+					doRender = false
+					a.skipCtr++
+				} else {
+					a.skipCtr = 0
+				}
+			}
+			if doRender {
+				a.m.StepFrame()
+			} else {
+				a.m.StepFrameNoRender()
+			}
 			a.frameAcc -= 1.0
 			steps++
 		}
@@ -833,6 +872,7 @@ func (a *App) Draw(screen *ebiten.Image) {
 		}
 		ebitenutil.DebugPrintAt(screen, fmt.Sprintf("Buf: %d (~%dms)", bf, ms), 4, 4)
 		ebitenutil.DebugPrintAt(screen, fmt.Sprintf("Under: %d  Read: %d/%d", und, lp, lw), 4, 18)
+		ebitenutil.DebugPrintAt(screen, fmt.Sprintf("Turbo: x%d  Skip: %v", a.turbo, a.skipOn), 4, 32)
 	}
 
 	// Toast message

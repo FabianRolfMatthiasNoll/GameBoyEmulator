@@ -3,6 +3,7 @@ package emu
 import (
 	"bytes"
 	"encoding/gob"
+	"math"
 	"os"
 
 	"github.com/FabianRolfMatthiasNoll/GameBoyEmulator/internal/bus"
@@ -42,7 +43,10 @@ type Machine struct {
 }
 
 // Human-friendly names for the curated DMG-on-CGB compatibility palettes.
-var cgbCompatSetNames = []string{"Green", "Sepia", "Blue", "Red", "Pastel", "Gray"}
+var cgbCompatSetNames = []string{
+	"Green", "Sepia", "Blue", "Red", "Pastel", "Gray",
+	"Teal Shade", "Purple Shade", "Amber Shade",
+}
 
 func New(cfg Config) *Machine {
 	return &Machine{
@@ -171,7 +175,7 @@ func (m *Machine) seedCGBCompatPalettesID(id int) {
 	red := [4]rgb{{0xFF, 0xE0, 0xE0}, {0xE8, 0x80, 0x80}, {0xB0, 0x30, 0x30}, {0x30, 0x10, 0x10}}
 	pastel := [4]rgb{{0xFF, 0xFF, 0xFF}, {0xCC, 0xEE, 0xCC}, {0x99, 0xCC, 0xCC}, {0x66, 0x99, 0x99}}
 	gray := [4]rgb{{0xFF, 0xFF, 0xFF}, {0xC0, 0xC0, 0xC0}, {0x60, 0x60, 0x60}, {0x00, 0x00, 0x00}}
-	// Build sets (BG, OBJ0, OBJ1). Keep BG vivid, give sprites slight contrast variants.
+	// Build sets (BG, OBJ0, OBJ1). Keep BG vivid; give sprites slight contrast variants.
 	cgbCompatSets := []set{
 		{bg: green, obj0: green, obj1: sepia},  // 0 default green with sepia alt
 		{bg: sepia, obj0: sepia, obj1: green},  // 1 sepia bg
@@ -180,6 +184,44 @@ func (m *Machine) seedCGBCompatPalettesID(id int) {
 		{bg: pastel, obj0: pastel, obj1: gray}, // 4 pastel
 		{bg: gray, obj0: gray, obj1: green},    // 5 neutral gray
 	}
+	// Shade-based synthetic palettes generated from HSL hues
+	genShade := func(h, s float64) [4]rgb {
+		// Four luminance levels from light to dark
+		L := []float64{0.92, 0.72, 0.45, 0.12}
+		var arr [4]rgb
+		for i := 0; i < 4; i++ {
+			r8, g8, b8 := hslToRGB(h, s, L[i])
+			arr[i] = rgb{r8, g8, b8}
+		}
+		return arr
+	}
+	teal := genShade(180, 0.55)
+	purple := genShade(280, 0.60)
+	amber := genShade(45, 0.70)
+	// Append synthetic shade sets (BG, OBJ0 same; OBJ1 slightly desaturated via mixing)
+	mix := func(a, b rgb, t float64) rgb {
+		return rgb{
+			byte(float64(a.r)*(1-t) + float64(b.r)*t),
+			byte(float64(a.g)*(1-t) + float64(b.g)*t),
+			byte(float64(a.b)*(1-t) + float64(b.b)*t),
+		}
+	}
+	toGray := func(c rgb) rgb {
+		y := byte(0.2126*float64(c.r) + 0.7152*float64(c.g) + 0.0722*float64(c.b))
+		return rgb{y, y, y}
+	}
+	toObj1 := func(arr [4]rgb) [4]rgb {
+		var out [4]rgb
+		for i := 0; i < 4; i++ {
+			out[i] = mix(arr[i], toGray(arr[i]), 0.25)
+		}
+		return out
+	}
+	cgbCompatSets = append(cgbCompatSets,
+		set{bg: teal, obj0: teal, obj1: toObj1(teal)},
+		set{bg: purple, obj0: purple, obj1: toObj1(purple)},
+		set{bg: amber, obj0: amber, obj1: toObj1(amber)},
+	)
 	if id < 0 {
 		id = 0
 	}
@@ -212,6 +254,43 @@ func (m *Machine) seedCGBCompatPalettesID(id int) {
 		c := sel.obj1[i]
 		writeRGB(0xFF6B, c.r, c.g, c.b)
 	}
+}
+
+// hslToRGB converts H, S, L (0..360, 0..1, 0..1) to 8-bit RGB.
+func hslToRGB(h, s, l float64) (byte, byte, byte) {
+	h = math.Mod(h, 360)
+	c := (1 - math.Abs(2*l-1)) * s
+	x := c * (1 - math.Abs(math.Mod(h/60.0, 2)-1))
+	m := l - c/2
+	var r1, g1, b1 float64
+	switch {
+	case 0 <= h && h < 60:
+		r1, g1, b1 = c, x, 0
+	case 60 <= h && h < 120:
+		r1, g1, b1 = x, c, 0
+	case 120 <= h && h < 180:
+		r1, g1, b1 = 0, c, x
+	case 180 <= h && h < 240:
+		r1, g1, b1 = 0, x, c
+	case 240 <= h && h < 300:
+		r1, g1, b1 = x, 0, c
+	default:
+		r1, g1, b1 = c, 0, x
+	}
+	r := byte(clamp01((r1 + m) * 255))
+	g := byte(clamp01((g1 + m) * 255))
+	b := byte(clamp01((b1 + m) * 255))
+	return r, g, b
+}
+
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return v
 }
 
 // SetUseFetcherBG toggles the BG renderer between classic and fetcher-based path.
@@ -435,18 +514,26 @@ func (m *Machine) LoadBattery(data []byte) bool {
 }
 
 func (m *Machine) StepFrame() {
-	// Advance CPU for approximately one frame worth of cycles (~70224)
-	if m.cpu != nil {
-		target := 70224
-		acc := 0
-		for acc < target {
-			acc += m.cpu.Step()
-		}
-	}
+	m.stepFrameCPU()
 	// Render background, window, then sprites
 	m.renderBG()
 	m.renderWindow()
 	m.renderSprites()
+}
+
+// StepFrameNoRender advances one frame of emulation without producing a new framebuffer.
+func (m *Machine) StepFrameNoRender() { m.stepFrameCPU() }
+
+// stepFrameCPU advances CPU for approximately one frame worth of cycles (~70224).
+func (m *Machine) stepFrameCPU() {
+	if m.cpu == nil {
+		return
+	}
+	target := 70224
+	acc := 0
+	for acc < target {
+		acc += m.cpu.Step()
+	}
 }
 
 func (m *Machine) Framebuffer() []byte { return m.fb }
@@ -829,6 +916,8 @@ func (m *Machine) renderBG() {
 		bgy := byte((uint16(lr.SCY) + uint16(y)) & 0xFF)
 		tileRow := uint16(bgy/8) * 32
 		fineY := bgy % 8
+		// In DMG-on-CGB compatibility mode, if BG CGB palettes are populated, use CRAM BG palette 0
+		useCompat := m.cgbCompat && m.bus.PPU().BGPalReady()
 		for x := 0; x < 160; x++ {
 			bgx := byte((uint16(lr.SCX) + uint16(x)) & 0xFF)
 			tileCol := uint16(bgx / 8)
@@ -844,28 +933,29 @@ func (m *Machine) renderBG() {
 			hi := m.bus.PPU().RawVRAM(tileAddr + 1)
 			bit := 7 - (bgx % 8)
 			ci := ((hi>>bit)&1)<<1 | ((lo >> bit) & 1)
-			// map BG color using the snapshot palette
-			bgp := lr.BGP
-			shade := func(ci byte) byte {
+			// map BG color using the snapshot palette or compat CRAM palette 0
+			if useCompat {
+				r, g, b := m.bus.PPU().BGColorRGB(0, ci)
+				i := (y*m.w + x) * 4
+				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = r, g, b, 0xFF
+			} else {
+				bgp := lr.BGP
 				shift := ci * 2
 				pal := (bgp >> shift) & 0x03
+				var s byte
 				switch pal {
 				case 0:
-					return 0xFF
+					s = 0xFF
 				case 1:
-					return 0xC0
+					s = 0xC0
 				case 2:
-					return 0x60
+					s = 0x60
 				default:
-					return 0x00
+					s = 0x00
 				}
+				i := (y*m.w + x) * 4
+				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = s, s, s, 0xFF
 			}
-			s := shade(ci)
-			i := (y*m.w + x) * 4
-			m.fb[i+0] = s
-			m.fb[i+1] = s
-			m.fb[i+2] = s
-			m.fb[i+3] = 0xFF
 			m.bgci[y*m.w+x] = ci
 		}
 	}
@@ -1044,23 +1134,6 @@ func (m *Machine) renderWindow() {
 		// Palette snapshot
 		bgp := lr.BGP
 		useCompat := m.cgbCompat && m.bus.PPU().BGPalReady()
-		shade := func(ci byte) (byte, byte, byte) {
-			if useCompat {
-				return m.bus.PPU().BGColorRGB(0, ci)
-			}
-			shift := ci * 2
-			pal := (bgp >> shift) & 0x03
-			switch pal {
-			case 0:
-				return 0xFF, 0xFF, 0xFF
-			case 1:
-				return 0xC0, 0xC0, 0xC0
-			case 2:
-				return 0x60, 0x60, 0x60
-			default:
-				return 0x00, 0x00, 0x00
-			}
-		}
 		for x := max(0, winXStart); x < 160; x++ {
 			winX := byte(x - winXStart)
 			tileCol := uint16(winX / 8)
@@ -1076,12 +1149,27 @@ func (m *Machine) renderWindow() {
 			hi := m.bus.PPU().RawVRAM(tileAddr + 1)
 			bit := 7 - (winX % 8)
 			ci := ((hi>>bit)&1)<<1 | ((lo >> bit) & 1)
-			r, g, b := shade(ci)
-			i := (y*m.w + x) * 4
-			m.fb[i+0] = r
-			m.fb[i+1] = g
-			m.fb[i+2] = b
-			m.fb[i+3] = 0xFF
+			if useCompat {
+				r, g, b := m.bus.PPU().BGColorRGB(0, ci)
+				i := (y*m.w + x) * 4
+				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = r, g, b, 0xFF
+			} else {
+				shift := ci * 2
+				pal := (bgp >> shift) & 0x03
+				var s byte
+				switch pal {
+				case 0:
+					s = 0xFF
+				case 1:
+					s = 0xC0
+				case 2:
+					s = 0x60
+				default:
+					s = 0x00
+				}
+				i := (y*m.w + x) * 4
+				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = s, s, s, 0xFF
+			}
 			m.bgci[y*m.w+x] = ci
 		}
 	}
