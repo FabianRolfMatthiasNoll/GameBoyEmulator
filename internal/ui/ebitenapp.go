@@ -629,21 +629,25 @@ func mod(a, b float) float {
 
 func Fragment(position vec4, srcPos vec2, color vec4) vec4 {
 	c := imageSrc0At(srcPos)
-	// scanlines every other row
+	// Visible scanlines every other row
 	if mod(floor(srcPos.y), 2.0) == 0.0 {
-		c.rgb *= 0.80
+		c.rgb *= 0.75
 	}
-	// very subtle barrel distortion vignette
-	sz := imageSrc0Size()
-	uv := (srcPos / sz) * 2.0 - 1.0
-	r2 := dot(uv, uv)
-	vignette := 1.0 - 0.10*r2
-	c.rgb *= vignette
-	// gentle bloom by sampling 4 neighbors
-	off := vec2(1.0, 1.0)
+	// Gentle phosphor triad mask across X
+	stripe := mod(floor(srcPos.x), 3.0)
+	mask := vec3(1.00, 1.00, 1.00)
+	if stripe == 0.0 {
+		mask = vec3(1.00, 0.95, 0.95)
+	} else if stripe == 1.0 {
+		mask = vec3(0.95, 1.00, 0.95)
+	} else {
+		mask = vec3(0.95, 0.95, 1.00)
+	}
+	c.rgb *= mask
+	// Mild bloom from neighbors
 	s := imageSrc0At(srcPos + vec2(1.0,0.0)).rgb + imageSrc0At(srcPos + vec2(-1.0,0.0)).rgb +
 		 imageSrc0At(srcPos + vec2(0.0,1.0)).rgb + imageSrc0At(srcPos + vec2(0.0,-1.0)).rgb
-	c.rgb = mix(c.rgb, s/4.0, 0.15)
+	c.rgb = mix(c.rgb, s/4.0, 0.10)
 	return c
 }
 `
@@ -656,8 +660,17 @@ package main
 func Fragment(position vec4, srcPos vec2, color vec4) vec4 {
 	cur := imageSrc0At(srcPos)
 	prev := imageSrc1At(srcPos)
-	// Blend with previous frame
-	rgb := mix(cur.rgb, prev.rgb, 0.45)
+    // Blend previous frame only where changes occur to create trails, not global blur
+    nb := (imageSrc1At(srcPos + vec2(1.0,0.0)).rgb + imageSrc1At(srcPos + vec2(-1.0,0.0)).rgb +
+	    imageSrc1At(srcPos + vec2(0.0,1.0)).rgb + imageSrc1At(srcPos + vec2(0.0,-1.0)).rgb) / 4.0
+    prevBlur := mix(prev.rgb, nb, 0.35)
+    d := abs(cur.rgb - prev.rgb)
+    // Use max channel diff as motion proxy
+    lum := max(d.r, max(d.g, d.b))
+    w := (lum - 0.03) / 0.25
+    if w < 0.0 { w = 0.0 }
+    if w > 1.0 { w = 1.0 }
+    rgb := mix(cur.rgb, prevBlur, 0.35*w)
 	return vec4(rgb, cur.a)
 }
 `
