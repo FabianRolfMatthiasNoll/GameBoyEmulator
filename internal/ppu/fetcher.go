@@ -9,6 +9,12 @@ type VRAMReader interface {
 	Read(addr uint16) byte
 }
 
+// VRAMBankedReader extends VRAMReader with a VRAM bank parameter (for CGB mode).
+// bank=0 selects VRAM bank 0; bank=1 selects VRAM bank 1.
+type VRAMBankedReader interface {
+	ReadBank(bank int, addr uint16) byte
+}
+
 // fifo is a simple ring buffer for 2-bit color indices (0..3).
 type fifo struct {
 	buf  [32]byte // room for several tiles

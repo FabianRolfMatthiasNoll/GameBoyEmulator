@@ -12,8 +12,15 @@ type InterruptRequester func(bit int)
 // It exposes CPU-facing Read/Write for VRAM/OAM and PPU IO regs.
 type PPU struct {
 	// memory
-	vram [0x2000]byte // 0x8000–0x9FFF
-	oam  [0xA0]byte   // 0xFE00–0xFE9F
+	vram  [0x2000]byte // 0x8000–0x9FFF
+	vram1 [0x2000]byte // CGB: VRAM bank 1 (0x8000–0x9FFF)
+	oam   [0xA0]byte   // 0xFE00–0xFE9F
+
+	// CGB color palettes (CRAM)
+	bgPal  [64]byte // 8 palettes * 4 colors * 2 bytes
+	objPal [64]byte // same for OBJ
+	bcps   byte     // FF68: BG palette index (bits0-5 addr, bit7 auto-inc)
+	ocps   byte     // FF6A: OBJ palette index
 
 	// regs
 	lcdc byte // FF40
@@ -39,7 +46,18 @@ type PPU struct {
 	winLineCounter byte
 }
 
-func New(req InterruptRequester) *PPU { return &PPU{req: req} }
+func New(req InterruptRequester) *PPU {
+	p := &PPU{req: req}
+	// Initialize CGB palettes to white so colors are visible before games set them.
+	// Each palette has 4 colors; color stored as RGB555 little-endian. White = 0x7FFF => lo=FF hi=7F.
+	for i := 0; i < 64; i += 2 {
+		p.bgPal[i] = 0xFF
+		p.bgPal[i+1] = 0x7F
+		p.objPal[i] = 0xFF
+		p.objPal[i+1] = 0x7F
+	}
+	return p
+}
 
 // LineRegs represents the PPU-visible registers relevant for rendering a scanline.
 type LineRegs struct {
@@ -93,6 +111,16 @@ func (p *PPU) CPURead(addr uint16) byte {
 		return p.wy
 	case addr == 0xFF4B:
 		return p.wx
+	case addr == 0xFF68: // BCPS/BGPI
+		return 0x40 | (p.bcps & 0xBF)
+	case addr == 0xFF69: // BCPD/BGPD
+		idx := int(p.bcps & 0x3F)
+		return p.bgPal[idx]
+	case addr == 0xFF6A: // OCPS/OBPI
+		return 0x40 | (p.ocps & 0xBF)
+	case addr == 0xFF6B: // OCPD/OBPD
+		idx := int(p.ocps & 0x3F)
+		return p.objPal[idx]
 	default:
 		return 0xFF
 	}
@@ -156,6 +184,29 @@ func (p *PPU) CPUWrite(addr uint16, value byte) {
 		p.wy = value
 	case addr == 0xFF4B:
 		p.wx = value
+	case addr == 0xFF68: // BCPS/BGPI
+		p.bcps = value & 0xBF // bit6 reads/writes as 0; keep bit7 as auto-inc flag
+	case addr == 0xFF69: // BCPD/BGPD
+		// Ignore writes during Mode 3 (approximation)
+		if (p.stat & 0x03) == 3 {
+			return
+		}
+		idx := int(p.bcps & 0x3F)
+		p.bgPal[idx] = value
+		if (p.bcps & 0x80) != 0 { // auto-increment
+			p.bcps = (p.bcps & 0xC0) | byte((idx+1)&0x3F)
+		}
+	case addr == 0xFF6A: // OCPS/OBPI
+		p.ocps = value & 0xBF
+	case addr == 0xFF6B: // OCPD/OBPD
+		if (p.stat & 0x03) == 3 {
+			return
+		}
+		idx := int(p.ocps & 0x3F)
+		p.objPal[idx] = value
+		if (p.ocps & 0x80) != 0 {
+			p.ocps = (p.ocps & 0xC0) | byte((idx+1)&0x3F)
+		}
 	}
 }
 
@@ -292,12 +343,54 @@ func (p *PPU) RawVRAM(addr uint16) byte {
 	return 0xFF
 }
 
+// RawVRAMBank returns a byte from the specified VRAM bank (0 or 1) without access restrictions.
+func (p *PPU) RawVRAMBank(bank int, addr uint16) byte {
+	if addr < 0x8000 || addr > 0x9FFF {
+		return 0xFF
+	}
+	off := addr - 0x8000
+	if bank == 0 {
+		return p.vram[off]
+	}
+	return p.vram1[off]
+}
+
 // RawOAM returns OAM bytes without CPU access restrictions; for renderer use only.
 func (p *PPU) RawOAM(addr uint16) byte {
 	if addr >= 0xFE00 && addr <= 0xFE9F {
 		return p.oam[addr-0xFE00]
 	}
 	return 0xFF
+}
+
+// --- CGB palette helpers ---
+// decodeRGB555 converts little-endian 15-bit color to 8-bit per channel (simple scale).
+func decodeRGB555(lo, hi byte) (r, g, b byte) {
+	v := uint16(lo) | (uint16(hi) << 8)
+	r5 := byte(v & 0x1F)
+	g5 := byte((v >> 5) & 0x1F)
+	b5 := byte((v >> 10) & 0x1F)
+	// scale 5-bit to 8-bit by left shift and OR with upper bits for a simple approximation
+	r = (r5 << 3) | (r5 >> 2)
+	g = (g5 << 3) | (g5 >> 2)
+	b = (b5 << 3) | (b5 >> 2)
+	return
+}
+
+// BGColorRGB returns the RGB color for given BG palette index (0..7) and color index (0..3).
+func (p *PPU) BGColorRGB(palIdx, colorIdx byte) (r, g, b byte) {
+	pi := int(palIdx&7)*8 + int(colorIdx&3)*2
+	lo := p.bgPal[pi]
+	hi := p.bgPal[pi+1]
+	return decodeRGB555(lo, hi)
+}
+
+// OBJColorRGB returns the RGB color for given OBJ palette index (0..7) and color index (1..3; 0 transparent).
+func (p *PPU) OBJColorRGB(palIdx, colorIdx byte) (r, g, b byte) {
+	pi := int(palIdx&7)*8 + int(colorIdx&3)*2
+	lo := p.objPal[pi]
+	hi := p.objPal[pi+1]
+	return decodeRGB555(lo, hi)
 }
 
 // Expose palettes and scroll for renderer convenience (optional helpers)
@@ -313,7 +406,12 @@ func (p *PPU) WX() byte   { return p.wx }
 // --- Save/Load state ---
 type ppuState struct {
 	VRAM     [0x2000]byte
+	VRAM1    [0x2000]byte
 	OAM      [0xA0]byte
+	BGPal    [64]byte
+	OBJPal   [64]byte
+	BCPS     byte
+	OCPS     byte
 	LCDC     byte
 	STAT     byte
 	SCY      byte
@@ -334,7 +432,8 @@ func (p *PPU) SaveState() []byte {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 	s := ppuState{
-		VRAM: p.vram, OAM: p.oam,
+		VRAM: p.vram, VRAM1: p.vram1, OAM: p.oam,
+		BGPal: p.bgPal, OBJPal: p.objPal, BCPS: p.bcps, OCPS: p.ocps,
 		LCDC: p.lcdc, STAT: p.stat, SCY: p.scy, SCX: p.scx, LY: p.ly, LYC: p.lyc,
 		BGP: p.bgp, OBP0: p.obp0, OBP1: p.obp1, WY: p.wy, WX: p.wx,
 		DOT: p.dot, LineRegs: p.lineRegs, WinLine: p.winLineCounter,
@@ -350,7 +449,12 @@ func (p *PPU) LoadState(data []byte) {
 		return
 	}
 	p.vram = s.VRAM
+	p.vram1 = s.VRAM1
 	p.oam = s.OAM
+	p.bgPal = s.BGPal
+	p.objPal = s.OBJPal
+	p.bcps = s.BCPS
+	p.ocps = s.OCPS
 	p.lcdc, p.stat, p.scy, p.scx, p.ly, p.lyc = s.LCDC, s.STAT, s.SCY, s.SCX, s.LY, s.LYC
 	p.bgp, p.obp0, p.obp1, p.wy, p.wx = s.BGP, s.OBP0, s.OBP1, s.WY, s.WX
 	p.dot = s.DOT

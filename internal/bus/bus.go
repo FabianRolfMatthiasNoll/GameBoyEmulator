@@ -186,7 +186,8 @@ func (b *Bus) Read(addr uint16) byte {
 	case addr == 0xFF40, addr == 0xFF41, addr == 0xFF42, addr == 0xFF43,
 		addr == 0xFF44, addr == 0xFF45,
 		addr == 0xFF47, addr == 0xFF48, addr == 0xFF49,
-		addr == 0xFF4A, addr == 0xFF4B:
+		addr == 0xFF4A, addr == 0xFF4B,
+		addr == 0xFF68, addr == 0xFF69, addr == 0xFF6A, addr == 0xFF6B:
 		return b.ppu.CPURead(addr)
 	// APU registers (subset): NR10..NR14, NR21..NR24, NR30..NR34, NR41..NR44, NR50..NR52, and wave RAM FF30..FF3F
 	case addr >= 0xFF10 && addr <= 0xFF14,
@@ -320,7 +321,8 @@ func (b *Bus) Write(addr uint16, value byte) {
 	case addr == 0xFF40, addr == 0xFF41, addr == 0xFF42, addr == 0xFF43,
 		addr == 0xFF44, addr == 0xFF45,
 		addr == 0xFF47, addr == 0xFF48, addr == 0xFF49,
-		addr == 0xFF4A, addr == 0xFF4B:
+		addr == 0xFF4A, addr == 0xFF4B,
+		addr == 0xFF68, addr == 0xFF69, addr == 0xFF6A, addr == 0xFF6B:
 		b.ppu.CPUWrite(addr, value)
 		return
 	// APU registers

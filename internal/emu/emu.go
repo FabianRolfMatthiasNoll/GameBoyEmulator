@@ -17,10 +17,12 @@ type Buttons struct {
 }
 
 type Machine struct {
-	cfg  Config
-	w, h int
-	fb   []byte // RGBA 160x144*4
-	bgci []byte // background/window color index buffer (0..3) per pixel for sprite priority
+	cfg   Config
+	w, h  int
+	fb    []byte // RGBA 160x144*4
+	bgci  []byte // BG/window color index (0..3) per pixel for priority
+	bgpal []byte // BG palette index (0..7) per pixel when in CGB path
+	bgpri []bool // BG priority flag per pixel when in CGB path
 	// core components
 	bus     *bus.Bus
 	cpu     *cpu.CPU
@@ -31,8 +33,10 @@ type Machine struct {
 func New(cfg Config) *Machine {
 	return &Machine{
 		cfg: cfg, w: 160, h: 144,
-		fb:   make([]byte, 160*144*4),
-		bgci: make([]byte, 160*144),
+		fb:    make([]byte, 160*144*4),
+		bgci:  make([]byte, 160*144),
+		bgpal: make([]byte, 160*144),
+		bgpri: make([]bool, 160*144),
 	}
 }
 
@@ -76,6 +80,12 @@ func (m *Machine) LoadCartridge(rom []byte, boot []byte) error {
 
 // SetUseFetcherBG toggles the BG renderer between classic and fetcher-based path.
 func (m *Machine) SetUseFetcherBG(on bool) { m.cfg.UseFetcherBG = on }
+
+// SetUseCGBBG toggles the CGB BG/Window/Sprite rendering path using CGB attributes and palettes.
+func (m *Machine) SetUseCGBBG(on bool) { m.cfg.UseCGBBG = on }
+
+// UseCGBBG reports whether the CGB rendering path is enabled.
+func (m *Machine) UseCGBBG() bool { return m.cfg.UseCGBBG }
 
 // LoadROMFromFile replaces the current cartridge with a ROM from disk, preserving boot ROM setting.
 func (m *Machine) LoadROMFromFile(path string) error {
@@ -350,6 +360,47 @@ func (m *Machine) renderBG() {
 	if m.bus == nil {
 		return
 	}
+	// CGB path with attributes: use banked VRAM and true color via CGB palettes.
+	if m.cfg.UseCGBBG {
+		for y := 0; y < 144; y++ {
+			lr := m.bus.PPU().LineRegs(y)
+			if lr.LCDC == 0 {
+				lr.LCDC = m.bus.Read(0xFF40)
+				lr.SCY = m.bus.Read(0xFF42)
+				lr.SCX = m.bus.Read(0xFF43)
+				lr.BGP = m.bus.Read(0xFF47)
+			}
+			if (lr.LCDC&0x80) == 0 || (lr.LCDC&0x01) == 0 {
+				for x := 0; x < 160; x++ {
+					i := (y*m.w + x) * 4
+					m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = 0xFF, 0xFF, 0xFF, 0xFF
+					m.bgci[y*m.w+x] = 0
+					m.bgpal[y*m.w+x] = 0
+					m.bgpri[y*m.w+x] = false
+				}
+				continue
+			}
+			mapBase := uint16(0x9800)
+			if (lr.LCDC & 0x08) != 0 {
+				mapBase = 0x9C00
+			}
+			attrsBase := mapBase + 0x2000 // attributes are at same offset in bank1
+			tileData8000 := (lr.LCDC & 0x10) != 0
+			vr := vramBankedAdapter{ppu: m.bus.PPU()}
+			line, pals, pris := ppu.RenderBGScanlineCGB(vr, mapBase, attrsBase, tileData8000, lr.SCX, lr.SCY, byte(y))
+			for x := 0; x < 160; x++ {
+				pal := pals[x]
+				ci := line[x]
+				r, g, b := m.bus.PPU().BGColorRGB(pal, ci)
+				i := (y*m.w + x) * 4
+				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = r, g, b, 0xFF
+				m.bgci[y*m.w+x] = ci
+				m.bgpal[y*m.w+x] = pal
+				m.bgpri[y*m.w+x] = pris[x]
+			}
+		}
+		return
+	}
 	// Optional fast path using fetcher/FIFO per-scanline renderer for BG layer
 	if m.cfg.UseFetcherBG {
 		for y := 0; y < 144; y++ {
@@ -482,8 +533,57 @@ type vramReaderAdapter struct{ ppu *ppu.PPU }
 
 func (a vramReaderAdapter) Read(addr uint16) byte { return a.ppu.RawVRAM(addr) }
 
+// vramBankedAdapter adapts PPU RawVRAM/RawVRAMBank to the CGB banked VRAM reader interface.
+type vramBankedAdapter struct{ ppu *ppu.PPU }
+
+func (a vramBankedAdapter) ReadBank(bank int, addr uint16) byte {
+	if bank == 0 {
+		return a.ppu.RawVRAM(addr)
+	}
+	return a.ppu.RawVRAMBank(1, addr)
+}
+
 func (m *Machine) renderWindow() {
 	if m.bus == nil {
+		return
+	}
+	if m.cfg.UseCGBBG {
+		for y := 0; y < 144; y++ {
+			lr := m.bus.PPU().LineRegs(y)
+			if lr.LCDC == 0 {
+				lr.LCDC = m.bus.Read(0xFF40)
+				lr.WY = m.bus.Read(0xFF4A)
+				lr.WX = m.bus.Read(0xFF4B)
+			}
+			if (lr.LCDC&0x80) == 0 || (lr.LCDC&0x01) == 0 || (lr.LCDC&0x20) == 0 {
+				continue
+			}
+			if y < int(lr.WY) || int(lr.WY) >= 144 {
+				continue
+			}
+			winXStart := int(lr.WX) - 7
+			if winXStart >= 160 {
+				continue
+			}
+			mapBase := uint16(0x9800)
+			if (lr.LCDC & 0x40) != 0 {
+				mapBase = 0x9C00
+			}
+			attrsBase := mapBase + 0x2000
+			tileData8000 := (lr.LCDC & 0x10) != 0
+			vr := vramBankedAdapter{ppu: m.bus.PPU()}
+			line, pals, pris := ppu.RenderWindowScanlineCGB(vr, mapBase, attrsBase, tileData8000, winXStart, lr.WinLine)
+			for x := max(0, winXStart); x < 160; x++ {
+				pal := pals[x]
+				ci := line[x]
+				r, g, b := m.bus.PPU().BGColorRGB(pal, ci)
+				i := (y*m.w + x) * 4
+				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = r, g, b, 0xFF
+				m.bgci[y*m.w+x] = ci
+				m.bgpal[y*m.w+x] = pal
+				m.bgpri[y*m.w+x] = pris[x]
+			}
+		}
 		return
 	}
 	// Optional fetcher-based window rendering
@@ -619,6 +719,116 @@ func (m *Machine) renderWindow() {
 // Sprite rendering with 8x8 and 8x16 support. Honors OBP0/OBP1 and BG priority via bgci.
 func (m *Machine) renderSprites() {
 	if m.bus == nil {
+		return
+	}
+	if m.cfg.UseCGBBG {
+		// CGB OBJ path: use bank, 8 palettes, and CGB priority.
+		for y := 0; y < 144; y++ {
+			lr := m.bus.PPU().LineRegs(y)
+			lcdc := lr.LCDC
+			if lcdc == 0 {
+				lcdc = m.bus.Read(0xFF40)
+			}
+			if (lcdc&0x80) == 0 || (lcdc&0x02) == 0 {
+				continue
+			}
+			sprite16 := (lcdc & 0x04) != 0
+			// Collect up to 10 sprites covering this line in OAM order
+			type oamE struct {
+				sy, sx     int
+				tile, attr byte
+				index      int
+			}
+			list := make([]oamE, 0, 10)
+			for i := 0; i < 40 && len(list) < 10; i++ {
+				base := uint16(0xFE00 + i*4)
+				sy := int(m.bus.PPU().RawOAM(base)) - 16
+				sx := int(m.bus.PPU().RawOAM(base+1)) - 8
+				tile := m.bus.PPU().RawOAM(base + 2)
+				attr := m.bus.PPU().RawOAM(base + 3)
+				h := 8
+				if sprite16 {
+					h = 16
+				}
+				if sy <= y && y < sy+h {
+					list = append(list, oamE{sy, sx, tile, attr, i})
+				}
+			}
+			if len(list) == 0 {
+				continue
+			}
+			// CGB OBJ drawing priority: OAM order only
+			// For each x, find first non-transparent pixel in OAM order, then apply BG-vs-OBJ rules.
+			for x := 0; x < 160; x++ {
+				var drawn bool
+				for _, s := range list {
+					if x < s.sx || x >= s.sx+8 {
+						continue
+					}
+					row := y - s.sy
+					col := x - s.sx
+					yflip := (s.attr & (1 << 6)) != 0
+					xflip := (s.attr & (1 << 5)) != 0
+					if yflip {
+						if sprite16 {
+							row = 15 - row
+						} else {
+							row = 7 - row
+						}
+					}
+					if xflip {
+						col = 7 - col
+					}
+					tIndex := s.tile
+					if sprite16 {
+						tIndex &= 0xFE
+						if row >= 8 {
+							tIndex++
+						}
+					}
+					rowWithin := row & 7
+					base := uint16(0x8000) + uint16(tIndex)*16 + uint16(rowWithin)*2
+					bank := 0
+					if (s.attr & (1 << 3)) != 0 {
+						bank = 1
+					}
+					var lo, hi byte
+					if bank == 0 {
+						lo = m.bus.PPU().RawVRAM(base)
+						hi = m.bus.PPU().RawVRAM(base + 1)
+					} else {
+						lo = m.bus.PPU().RawVRAMBank(1, base)
+						hi = m.bus.PPU().RawVRAMBank(1, base+1)
+					}
+					bit := 7 - byte(col%8)
+					ci := ((hi>>bit)&1)<<1 | ((lo >> bit) & 1)
+					if ci == 0 {
+						continue
+					}
+					// BG vs OBJ priority (CGB): if BG index is 0 -> OBJ wins; else if LCDC bit0 clear -> OBJ wins
+					bgci := m.bgci[y*m.w+x]
+					if bgci != 0 {
+						if (lcdc & 0x01) == 0 {
+							// OBJ wins
+						} else {
+							bgPri := m.bgpri[y*m.w+x]
+							objBehind := (s.attr & (1 << 7)) != 0 // note: in CGB, clear means OBJ priority
+							// If both BG attr bit7 and OBJ attr bit7 are clear -> OBJ wins; otherwise BG in front
+							if bgPri || objBehind { // BG should be in front for non-zero BG
+								continue
+							}
+						}
+					}
+					pal := s.attr & 0x07
+					r, g, b := m.bus.PPU().OBJColorRGB(pal, ci)
+					i := (y*m.w + x) * 4
+					m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = r, g, b, 0xFF
+					drawn = true
+					break
+				}
+				_ = drawn
+			}
+		}
 		return
 	}
 	if m.cfg.UseFetcherBG {

@@ -60,6 +60,7 @@ type App struct {
 	// settings edit state
 	editingROMDir bool
 	romDirInput   string
+	settingsOff   int // scroll offset for settings list
 
 	// toast feedback
 	toastMsg   string
@@ -97,6 +98,7 @@ func NewApp(cfg Config, m *emu.Machine) *App {
 	a.currentSlot = 0
 	// init ROM dir input for editing
 	a.romDirInput = cfg.ROMsDir
+	a.settingsOff = 0
 	// Propagate rendering config into emulator
 	if m != nil {
 		m.SetUseFetcherBG(a.cfg.UseFetcherBG)
@@ -376,14 +378,27 @@ func (a *App) Update() error {
 				a.menuMode = "main"
 			}
 		case "settings":
-			// Items: Scale, Audio, Audio Adaptive, Low-Latency, BG Renderer, ROMs Dir (editable)
-			items := 6
+			// Items: Scale, Audio, Audio Adaptive, Low-Latency, BG Renderer, ROMs Dir (editable), CGB BG (exp)
+			items := 7
 			if !a.editingROMDir { // normal navigation when not editing
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) && a.menuIdx > 0 {
 					a.menuIdx--
 				}
 				if inpututil.IsKeyJustPressed(ebiten.KeyArrowDown) && a.menuIdx < items-1 {
 					a.menuIdx++
+				}
+				// maintain scroll window
+				title := "Settings (Up/Down select; Left/Right change; Enter: edit/apply; Backspace/Esc: back)"
+				baseY := 10 + 14*len(a.wrapText(title, a.maxCharsForText(10))) + 14
+				maxRows := (144 - baseY) / 14
+				if maxRows < 1 {
+					maxRows = 1
+				}
+				if a.menuIdx < a.settingsOff {
+					a.settingsOff = a.menuIdx
+				}
+				if a.menuIdx >= a.settingsOff+maxRows {
+					a.settingsOff = a.menuIdx - maxRows + 1
 				}
 			}
 			if a.menuIdx == 0 && !a.editingROMDir { // Scale
@@ -473,6 +488,12 @@ func (a *App) Update() error {
 					if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
 						a.editingROMDir = false
 						a.romDirInput = a.cfg.ROMsDir
+					}
+				}
+			} else if a.menuIdx == 6 && !a.editingROMDir { // CGB Colors toggle
+				if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) || inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
+					if a.m != nil {
+						a.m.SetUseCGBBG(!a.m.UseCGBBG())
 					}
 				}
 			}
@@ -894,15 +915,32 @@ func (a *App) Draw(screen *ebiten.Image) {
 				fmt.Sprintf("Low-Latency Audio: %s", map[bool]string{true: "On", false: "Off"}[a.cfg.AudioLowLatency]),
 				fmt.Sprintf("BG Renderer: %s", map[bool]string{true: "Fetcher", false: "Classic"}[a.cfg.UseFetcherBG]),
 				fmt.Sprintf("ROMs Dir: %s", a.truncateText(romDir, a.maxCharsForText(10)-11)),
+				fmt.Sprintf("CGB Colors (BG/Window/Sprites): %s", map[bool]string{true: "On", false: "Off"}[a.m != nil && a.m.UseCGBBG()]),
 			}
-			for i, it := range items {
+			baseY := cursorY
+			maxRows := (144 - baseY) / 14
+			if maxRows < 1 {
+				maxRows = 1
+			}
+			end := a.settingsOff + maxRows
+			if end > len(items) {
+				end = len(items)
+			}
+			for i := a.settingsOff; i < end; i++ {
 				prefix := "  "
 				if i == a.menuIdx {
 					prefix = "> "
 				}
-				line := prefix + it
+				line := prefix + items[i]
 				line = a.truncateText(line, a.maxCharsForText(10))
-				ebitenutil.DebugPrintAt(screen, line, 10, cursorY+i*14)
+				ebitenutil.DebugPrintAt(screen, line, 10, baseY+(i-a.settingsOff)*14)
+			}
+			// scroll indicators
+			if a.settingsOff > 0 {
+				ebitenutil.DebugPrintAt(screen, "^", 2, baseY)
+			}
+			if end < len(items) {
+				ebitenutil.DebugPrintAt(screen, "v", 2, baseY+(maxRows-1)*14)
 			}
 		}
 	}

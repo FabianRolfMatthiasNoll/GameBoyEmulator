@@ -80,6 +80,167 @@ func RenderWindowScanlineUsingFetcher(mem VRAMReader, mapBase uint16, tileData80
 	return out
 }
 
+// CGB BG attributes (tilemap attribute byte at 0x9800/0x9C00 + 0x2000 on CGB):
+// bit7: BG-to-OBJ priority (1: BG has priority when OBJ pixel non-zero)
+// bit6: Y flip
+// bit5: X flip
+// bit4: VRAM bank for tile data (0/1)
+// bit2-0: BG palette number (0..7)
+
+// RenderBGScanlineCGB renders a CGB BG scanline honoring attributes and returns:
+// - color indices (0..3) per pixel
+// - per-pixel palette index (0..7) for BG
+// - per-pixel BG priority flag (true when BG should be kept in front of OBJ)
+// mem must implement VRAMBankedReader.
+func RenderBGScanlineCGB(mem VRAMBankedReader, mapBase uint16, attrsBase uint16, tileData8000 bool, scx, scy, ly byte) (ci [160]byte, pal [160]byte, pri [160]bool) {
+	// Compute BG coordinates
+	bgY := uint16(ly) + uint16(scy)
+	fineY := byte(bgY & 7)
+	mapY := (bgY >> 3) & 31
+	startX := uint16(scx)
+	tileX := (startX >> 3) & 31
+	fineX := int(startX & 7)
+	idxAddr := mapBase + mapY*32 + tileX
+	attrAddr := attrsBase + mapY*32 + tileX
+
+	// Local FIFO of currently active tile row
+	var rowPix [8]byte
+	var rowPal byte
+	var rowPri bool
+	pixelsLeft := 0
+
+	// Helper to fetch next tile row according to attributes
+	fetch := func() {
+		tileNum := mem.ReadBank(0, idxAddr) // tile index from VRAM bank 0
+		attr := mem.ReadBank(1, attrAddr)   // attributes stored in VRAM bank 1
+		bank := 0
+		if (attr & (1 << 4)) != 0 {
+			bank = 1
+		}
+		yflip := (attr & (1 << 6)) != 0
+		xflip := (attr & (1 << 5)) != 0
+		row := fineY
+		if yflip {
+			row = 7 - row
+		}
+		var base uint16
+		if tileData8000 {
+			base = 0x8000 + uint16(tileNum)*16 + uint16(row)*2
+		} else {
+			base = 0x9000 + uint16(int8(tileNum))*16 + uint16(row)*2
+		}
+		lo := mem.ReadBank(bank, base)
+		hi := mem.ReadBank(bank, base+1)
+		for px := 0; px < 8; px++ {
+			b := byte(px)
+			if xflip {
+				b = 7 - b
+			}
+			bit := 7 - b
+			rowPix[px] = ((hi>>bit)&1)<<1 | ((lo >> bit) & 1)
+		}
+		rowPal = attr & 0x07
+		rowPri = (attr & (1 << 7)) != 0
+		pixelsLeft = 8
+		// advance map pointers to next tile
+		tileX = (tileX + 1) & 31
+		idxAddr = mapBase + mapY*32 + tileX
+		attrAddr = attrsBase + mapY*32 + tileX
+	}
+
+	// Initial fetch
+	fetch()
+	// Discard fineX pixels
+	off := fineX
+	if off > 0 {
+		if off >= 8 {
+			off = 7
+		}
+		for i := 0; i < off; i++ {
+			pixelsLeft--
+		}
+	}
+	// Emit 160 pixels
+	for x := 0; x < 160; x++ {
+		if pixelsLeft <= 0 {
+			fetch()
+		}
+		idx := 8 - pixelsLeft
+		ci[x] = rowPix[idx]
+		pal[x] = rowPal
+		pri[x] = rowPri
+		pixelsLeft--
+	}
+	return
+}
+
+// RenderWindowScanlineCGB is a CGB-aware window renderer returning BG pixel data + palette/prio.
+func RenderWindowScanlineCGB(mem VRAMBankedReader, mapBase uint16, attrsBase uint16, tileData8000 bool, wxStart int, winLine byte) (ci [160]byte, pal [160]byte, pri [160]bool) {
+	if wxStart >= 160 {
+		return
+	}
+	if wxStart < 0 {
+		wxStart = 0
+	}
+	mapY := (uint16(winLine) >> 3) & 31
+	fineY := winLine & 7
+	tileX := uint16(0)
+	idxAddr := mapBase + mapY*32 + tileX
+	attrAddr := attrsBase + mapY*32 + tileX
+	var rowPix [8]byte
+	var rowPal byte
+	var rowPri bool
+	pixelsLeft := 0
+	fetch := func() {
+		tileNum := mem.ReadBank(0, idxAddr)
+		attr := mem.ReadBank(1, attrAddr)
+		bank := 0
+		if (attr & (1 << 4)) != 0 {
+			bank = 1
+		}
+		yflip := (attr & (1 << 6)) != 0
+		xflip := (attr & (1 << 5)) != 0
+		row := fineY
+		if yflip {
+			row = 7 - row
+		}
+		var base uint16
+		if tileData8000 {
+			base = 0x8000 + uint16(tileNum)*16 + uint16(row)*2
+		} else {
+			base = 0x9000 + uint16(int8(tileNum))*16 + uint16(row)*2
+		}
+		lo := mem.ReadBank(bank, base)
+		hi := mem.ReadBank(bank, base+1)
+		for px := 0; px < 8; px++ {
+			b := byte(px)
+			if xflip {
+				b = 7 - b
+			}
+			bit := 7 - b
+			rowPix[px] = ((hi>>bit)&1)<<1 | ((lo >> bit) & 1)
+		}
+		rowPal = attr & 0x07
+		rowPri = (attr & (1 << 7)) != 0
+		pixelsLeft = 8
+		tileX = (tileX + 1) & 31
+		idxAddr = mapBase + mapY*32 + tileX
+		attrAddr = attrsBase + mapY*32 + tileX
+	}
+	fetch()
+	for x := wxStart; x < 160; x++ {
+		if pixelsLeft <= 0 {
+			fetch()
+		}
+		idx := 8 - pixelsLeft
+		ci[x] = rowPix[idx]
+		pal[x] = rowPal
+		pri[x] = rowPri
+		pixelsLeft--
+	}
+	return
+}
+
 // Sprite describes the minimal fields required to composite a sprite onto a scanline.
 type Sprite struct {
 	X        int  // screen X (0..159)
