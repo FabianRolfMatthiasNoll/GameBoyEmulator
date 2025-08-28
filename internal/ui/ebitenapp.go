@@ -915,7 +915,7 @@ func (a *App) Draw(screen *ebiten.Image) {
 				fmt.Sprintf("Low-Latency Audio: %s", map[bool]string{true: "On", false: "Off"}[a.cfg.AudioLowLatency]),
 				fmt.Sprintf("BG Renderer: %s", map[bool]string{true: "Fetcher", false: "Classic"}[a.cfg.UseFetcherBG]),
 				fmt.Sprintf("ROMs Dir: %s", a.truncateText(romDir, a.maxCharsForText(10)-11)),
-				fmt.Sprintf("CGB Colors (BG/Window/Sprites): %s", map[bool]string{true: "On", false: "Off"}[a.m != nil && a.m.UseCGBBG()]),
+				fmt.Sprintf("CGB Colors: %s", map[bool]string{true: "On", false: "Off"}[a.m != nil && a.m.UseCGBBG()]),
 			}
 			baseY := cursorY
 			maxRows := (144 - baseY) / 14

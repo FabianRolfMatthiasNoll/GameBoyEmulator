@@ -20,6 +20,7 @@ import (
 type CLIFlags struct {
 	ROMPath      string
 	BootROM      string
+	CGBBootROM   string
 	Scale        int
 	Title        string
 	Trace        bool
@@ -37,6 +38,7 @@ func parseFlags() CLIFlags {
 	var f CLIFlags
 	flag.StringVar(&f.ROMPath, "rom", "", "path to ROM (.gb)")
 	flag.StringVar(&f.BootROM, "bootrom", "", "optional DMG boot ROM")
+	flag.StringVar(&f.CGBBootROM, "cgbboot", "", "optional CGB boot ROM")
 	flag.IntVar(&f.Scale, "scale", 3, "window scale")
 	flag.StringVar(&f.Title, "title", "gbemu", "window title")
 	flag.BoolVar(&f.Trace, "trace", false, "CPU trace log")
@@ -121,6 +123,7 @@ func main() {
 		rom = mustRead(f.ROMPath)
 	}
 	boot := mustRead(f.BootROM)
+	cgbBoot := mustRead(f.CGBBootROM)
 
 	if len(rom) >= 0x150 {
 		if h, err := cart.ParseHeader(rom); err == nil {
@@ -137,6 +140,9 @@ func main() {
 	if len(boot) >= 0x100 {
 		m.SetBootROM(boot)
 	}
+	if len(cgbBoot) >= 0x800 {
+		m.SetCGBBootROM(cgbBoot)
+	}
 	if len(rom) > 0 {
 		if err := m.LoadCartridge(rom, boot); err != nil {
 			log.Fatalf("load cart: %v", err)
@@ -150,11 +156,32 @@ func main() {
 			}
 		}
 	}
-	// Always run via boot ROM if available
-	if m.HasBootROM() {
-		m.ResetWithBoot()
+	// Choose boot ROM based on ROM header and current CGB toggle
+	// Prefer CGB boot for CGB-capable ROMs when CGB colors are enabled; else DMG boot if available.
+	if h, err := cart.ParseHeader(rom); err == nil {
+		// CGB-only carts have CGBFlag 0xC0; dual carts have 0x80
+		cgbOnly := (h.CGBFlag & 0xC0) == 0xC0
+		useCGB := (h.CGBFlag & 0x80) != 0
+		// Honor user toggle for dual carts; force CGB for CGB-only
+		if cgbOnly {
+			useCGB = true
+		} else if !m.UseCGBBG() {
+			useCGB = false
+		}
+		if useCGB {
+			// Our CPU core doesn’t implement the full CGB boot ROM; simulate CGB post-boot instead.
+			m.ResetCGBPostBoot(false)
+		} else if len(boot) >= 0x100 {
+			m.ResetWithBoot()
+		} else {
+			m.ResetPostBoot()
+		}
 	} else {
-		m.ResetPostBoot()
+		if m.HasBootROM() {
+			m.ResetWithBoot()
+		} else {
+			m.ResetPostBoot()
+		}
 	}
 
 	// Battery RAM: load .sav if present

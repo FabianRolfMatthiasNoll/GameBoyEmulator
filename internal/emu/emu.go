@@ -24,10 +24,13 @@ type Machine struct {
 	bgpal []byte // BG palette index (0..7) per pixel when in CGB path
 	bgpri []bool // BG priority flag per pixel when in CGB path
 	// core components
-	bus     *bus.Bus
-	cpu     *cpu.CPU
-	romPath string
-	bootROM []byte
+	bus        *bus.Bus
+	cpu        *cpu.CPU
+	romPath    string
+	bootROM    []byte
+	cgbBootROM []byte
+	// ROM capability (from header): if false, do not expose CGB hardware even if toggle is on
+	cgbCapable bool
 }
 
 func New(cfg Config) *Machine {
@@ -47,14 +50,27 @@ func (m *Machine) LoadCartridge(rom []byte, boot []byte) error {
 		return err
 	}
 	_ = romHeader
+	// Record whether the ROM supports or requires CGB features
+	m.cgbCapable = false
+	if romHeader != nil {
+		if (romHeader.CGBFlag & 0x80) != 0 { // supports CGB (0x80) or CGB-only (0xC0)
+			m.cgbCapable = true
+		}
+	}
+	// Decide whether to use the supplied boot ROM. If a DMG boot ROM is provided
+	// (256 bytes) but the game is CGB-capable, ignore it; without a proper CGB boot ROM,
+	// start directly at $0100 with CGB post-boot semantics so the game detects CGB.
+	useBoot := len(boot) >= 0x100
+	if romHeader != nil && (romHeader.CGBFlag&0x80) != 0 && len(boot) == 0x100 {
+		useBoot = false
+	}
 	// Wire bus+cpu. For now, ROM-only cartridge via bus.New.
 	b := bus.New(rom)
-	// If a boot ROM is provided, install it and start from 0x0000 with boot enabled.
-	if len(boot) >= 0x100 {
+	if useBoot {
 		b.SetBootROM(boot)
 	}
 	c := cpu.New(b)
-	if len(boot) >= 0x100 {
+	if useBoot {
 		// Boot ROM path: start at 0x0000; do not force post-boot IO
 		c.SP = 0xFFFE
 		c.PC = 0x0000
@@ -63,6 +79,10 @@ func (m *Machine) LoadCartridge(rom []byte, boot []byte) error {
 		// No boot ROM: initialize to DMG post-boot state
 		c.ResetNoBoot()
 		c.SetPC(0x0100)
+		// If the game is CGB-capable, set A=$11 so it detects CGB hardware per Pan Docs
+		if romHeader != nil && (romHeader.CGBFlag&0x80) != 0 {
+			c.A = 0x11
+		}
 	}
 	m.bus = b
 	m.cpu = c
@@ -75,6 +95,22 @@ func (m *Machine) LoadCartridge(rom []byte, boot []byte) error {
 	if len(boot) < 0x100 {
 		m.applyDMGPostBootIO()
 	}
+	// Auto-enable CGB color path if ROM indicates CGB support
+	if romHeader != nil {
+		// CGBFlag: 0x80 = supports CGB (works on DMG), 0xC0 = CGB only
+		if romHeader.CGBFlag&0x80 != 0 {
+			m.cfg.UseCGBBG = true
+			if m.bus != nil {
+				m.bus.SetCGBMode(true)
+			}
+		} else {
+			// for pure DMG, default to classic
+			m.cfg.UseCGBBG = false
+			if m.bus != nil {
+				m.bus.SetCGBMode(false)
+			}
+		}
+	}
 	return nil
 }
 
@@ -82,10 +118,16 @@ func (m *Machine) LoadCartridge(rom []byte, boot []byte) error {
 func (m *Machine) SetUseFetcherBG(on bool) { m.cfg.UseFetcherBG = on }
 
 // SetUseCGBBG toggles the CGB BG/Window/Sprite rendering path using CGB attributes and palettes.
-func (m *Machine) SetUseCGBBG(on bool) { m.cfg.UseCGBBG = on }
+func (m *Machine) SetUseCGBBG(on bool) {
+	m.cfg.UseCGBBG = on
+	if m.bus != nil {
+		// Only expose CGB hardware if the loaded ROM is CGB-capable
+		m.bus.SetCGBMode(on && m.cgbCapable)
+	}
+}
 
 // UseCGBBG reports whether the CGB rendering path is enabled.
-func (m *Machine) UseCGBBG() bool { return m.cfg.UseCGBBG }
+func (m *Machine) UseCGBBG() bool { return m.cfg.UseCGBBG && m.cgbCapable }
 
 // LoadROMFromFile replaces the current cartridge with a ROM from disk, preserving boot ROM setting.
 func (m *Machine) LoadROMFromFile(path string) error {
@@ -126,8 +168,27 @@ func (m *Machine) SetBootROM(data []byte) {
 	}
 }
 
+// SetCGBBootROM sets the CGB boot ROM used when starting CGB-capable games.
+func (m *Machine) SetCGBBootROM(data []byte) {
+	if len(data) >= 0x800 {
+		m.cgbBootROM = make([]byte, 0x800)
+		copy(m.cgbBootROM, data[len(data)-0x800:])
+	} else if len(data) >= 0x900 {
+		m.cgbBootROM = make([]byte, 0x800)
+		copy(m.cgbBootROM, data[len(data)-0x800:])
+	} else {
+		m.cgbBootROM = nil
+	}
+	if m.bus != nil {
+		m.bus.SetCGBBootROM(m.cgbBootROM)
+	}
+}
+
 // HasBootROM reports whether a DMG boot ROM is configured on this machine.
 func (m *Machine) HasBootROM() bool { return len(m.bootROM) >= 0x100 }
+
+// HasCGBBootROM reports whether a CGB boot ROM is configured.
+func (m *Machine) HasCGBBootROM() bool { return len(m.cgbBootROM) >= 0x800 }
 
 // ResetPostBoot resets CPU and IO to DMG post-boot state (no boot ROM), keeping the loaded cartridge.
 func (m *Machine) ResetPostBoot() {
@@ -137,6 +198,7 @@ func (m *Machine) ResetPostBoot() {
 	m.cpu.ResetNoBoot()
 	m.cpu.SetPC(0x0100)
 	m.applyDMGPostBootIO()
+	m.bus.EnableBoot(0)
 }
 
 // ResetWithBoot re-enables the boot ROM (if present) and restarts execution from 0x0000.
@@ -147,9 +209,42 @@ func (m *Machine) ResetWithBoot() {
 		return
 	}
 	m.bus.SetBootROM(m.bootROM)
+	m.bus.EnableBoot(1)
 	m.cpu.SP = 0xFFFE
 	m.cpu.PC = 0x0000
 	m.cpu.IME = false
+}
+
+// ResetWithCGBBoot enables the CGB boot ROM and restarts from 0x0000.
+func (m *Machine) ResetWithCGBBoot() {
+	if m.cpu == nil || m.bus == nil || len(m.cgbBootROM) < 0x800 {
+		m.ResetPostBoot()
+		return
+	}
+	m.bus.SetCGBBootROM(m.cgbBootROM)
+	m.bus.EnableBoot(2)
+	m.cpu.SP = 0xFFFE
+	m.cpu.PC = 0x0000
+	m.cpu.IME = false
+}
+
+// ResetCGBPostBoot simulates the CGB boot hand-off: enables CGB hardware, sets A=0x11, and jumps to $0100.
+// If compat is true (DMG ROM on CGB), this represents DMG compatibility mode; we still enable CGB hardware
+// so palettes and VBK/SVBK exist, but DMG games will keep grayscale unless we implement compatibility palettes.
+func (m *Machine) ResetCGBPostBoot(compat bool) {
+	if m.cpu == nil || m.bus == nil {
+		return
+	}
+	// Expose CGB hardware to the CPU
+	m.bus.SetCGBMode(true)
+	// Clear any boot mapping
+	m.bus.EnableBoot(0)
+	// CPU state like CGB after boot
+	m.cpu.ResetNoBoot()
+	m.cpu.SetPC(0x0100)
+	m.cpu.A = 0x11 // indicate CGB hardware per Pan Docs
+	// Set minimal IO similar to applyDMGPostBootIO
+	m.applyDMGPostBootIO()
 }
 
 // applyDMGPostBootIO sets a minimal set of IO registers to DMG post-boot defaults,
@@ -361,7 +456,7 @@ func (m *Machine) renderBG() {
 		return
 	}
 	// CGB path with attributes: use banked VRAM and true color via CGB palettes.
-	if m.cfg.UseCGBBG {
+	if m.cfg.UseCGBBG && m.cgbCapable {
 		for y := 0; y < 144; y++ {
 			lr := m.bus.PPU().LineRegs(y)
 			if lr.LCDC == 0 {
@@ -384,14 +479,42 @@ func (m *Machine) renderBG() {
 			if (lr.LCDC & 0x08) != 0 {
 				mapBase = 0x9C00
 			}
-			attrsBase := mapBase + 0x2000 // attributes are at same offset in bank1
+			attrsBase := mapBase // attributes in bank 1 at same addresses
 			tileData8000 := (lr.LCDC & 0x10) != 0
 			vr := vramBankedAdapter{ppu: m.bus.PPU()}
 			line, pals, pris := ppu.RenderBGScanlineCGB(vr, mapBase, attrsBase, tileData8000, lr.SCX, lr.SCY, byte(y))
+			// If CGB BG palettes haven't been written yet (DMG ROM or early boot), fallback to DMG BGP grayscale.
+			useDMGPal := !m.bus.PPU().BGPalReady()
+			var bgp byte
+			if useDMGPal {
+				bgp = lr.BGP
+				if lr.LCDC == 0 {
+					bgp = m.bus.Read(0xFF47)
+				}
+			}
+			shade := func(ci byte) (byte, byte, byte) {
+				shift := ci * 2
+				pal := (bgp >> shift) & 0x03
+				switch pal {
+				case 0:
+					return 0xFF, 0xFF, 0xFF
+				case 1:
+					return 0xC0, 0xC0, 0xC0
+				case 2:
+					return 0x60, 0x60, 0x60
+				default:
+					return 0x00, 0x00, 0x00
+				}
+			}
 			for x := 0; x < 160; x++ {
 				pal := pals[x]
 				ci := line[x]
-				r, g, b := m.bus.PPU().BGColorRGB(pal, ci)
+				var r, g, b byte
+				if useDMGPal {
+					r, g, b = shade(ci)
+				} else {
+					r, g, b = m.bus.PPU().BGColorRGB(pal, ci)
+				}
 				i := (y*m.w + x) * 4
 				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = r, g, b, 0xFF
 				m.bgci[y*m.w+x] = ci
@@ -547,7 +670,7 @@ func (m *Machine) renderWindow() {
 	if m.bus == nil {
 		return
 	}
-	if m.cfg.UseCGBBG {
+	if m.cfg.UseCGBBG && m.cgbCapable {
 		for y := 0; y < 144; y++ {
 			lr := m.bus.PPU().LineRegs(y)
 			if lr.LCDC == 0 {
@@ -569,14 +692,38 @@ func (m *Machine) renderWindow() {
 			if (lr.LCDC & 0x40) != 0 {
 				mapBase = 0x9C00
 			}
-			attrsBase := mapBase + 0x2000
+			attrsBase := mapBase
 			tileData8000 := (lr.LCDC & 0x10) != 0
 			vr := vramBankedAdapter{ppu: m.bus.PPU()}
 			line, pals, pris := ppu.RenderWindowScanlineCGB(vr, mapBase, attrsBase, tileData8000, winXStart, lr.WinLine)
+			useDMGPal := !m.bus.PPU().BGPalReady()
+			var bgp byte
+			if useDMGPal {
+				bgp = m.bus.Read(0xFF47)
+			}
+			shade := func(ci byte) (byte, byte, byte) {
+				shift := ci * 2
+				pal := (bgp >> shift) & 0x03
+				switch pal {
+				case 0:
+					return 0xFF, 0xFF, 0xFF
+				case 1:
+					return 0xC0, 0xC0, 0xC0
+				case 2:
+					return 0x60, 0x60, 0x60
+				default:
+					return 0x00, 0x00, 0x00
+				}
+			}
 			for x := max(0, winXStart); x < 160; x++ {
 				pal := pals[x]
 				ci := line[x]
-				r, g, b := m.bus.PPU().BGColorRGB(pal, ci)
+				var r, g, b byte
+				if useDMGPal {
+					r, g, b = shade(ci)
+				} else {
+					r, g, b = m.bus.PPU().BGColorRGB(pal, ci)
+				}
 				i := (y*m.w + x) * 4
 				m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = r, g, b, 0xFF
 				m.bgci[y*m.w+x] = ci
@@ -721,7 +868,7 @@ func (m *Machine) renderSprites() {
 	if m.bus == nil {
 		return
 	}
-	if m.cfg.UseCGBBG {
+	if m.cfg.UseCGBBG && m.cgbCapable {
 		// CGB OBJ path: use bank, 8 palettes, and CGB priority.
 		for y := 0; y < 144; y++ {
 			lr := m.bus.PPU().LineRegs(y)
@@ -759,6 +906,14 @@ func (m *Machine) renderSprites() {
 			}
 			// CGB OBJ drawing priority: OAM order only
 			// For each x, find first non-transparent pixel in OAM order, then apply BG-vs-OBJ rules.
+			// Snapshot OBP0/OBP1 for DMG fallback shading if OBJ CGB palettes aren't ready yet
+			obp0 := lr.OBP0
+			obp1 := lr.OBP1
+			if lr.LCDC == 0 { // if no snapshot captured yet, use live regs
+				obp0 = m.bus.Read(0xFF48)
+				obp1 = m.bus.Read(0xFF49)
+			}
+			useOBJPal := m.bus.PPU().OBJPalReady()
 			for x := 0; x < 160; x++ {
 				var drawn bool
 				for _, s := range list {
@@ -820,7 +975,31 @@ func (m *Machine) renderSprites() {
 						}
 					}
 					pal := s.attr & 0x07
-					r, g, b := m.bus.PPU().OBJColorRGB(pal, ci)
+					var r, g, b byte
+					if useOBJPal {
+						r, g, b = m.bus.PPU().OBJColorRGB(pal, ci)
+					} else {
+						// DMG sprite shading via OBP0/OBP1 to avoid white sprites before palettes are set
+						// Choose DMG palette by attr bit4
+						dmgPal := obp0
+						if (s.attr & (1 << 4)) != 0 {
+							dmgPal = obp1
+						}
+						shift := ci * 2
+						p := (dmgPal >> shift) & 0x03
+						var gray byte
+						switch p {
+						case 0:
+							gray = 0xFF
+						case 1:
+							gray = 0xC0
+						case 2:
+							gray = 0x60
+						default:
+							gray = 0x00
+						}
+						r, g, b = gray, gray, gray
+					}
 					i := (y*m.w + x) * 4
 					m.fb[i+0], m.fb[i+1], m.fb[i+2], m.fb[i+3] = r, g, b, 0xFF
 					drawn = true

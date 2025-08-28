@@ -92,6 +92,7 @@ func RenderWindowScanlineUsingFetcher(mem VRAMReader, mapBase uint16, tileData80
 // - per-pixel palette index (0..7) for BG
 // - per-pixel BG priority flag (true when BG should be kept in front of OBJ)
 // mem must implement VRAMBankedReader.
+// attrsBase must be the bank-1 address corresponding to mapBase (same address value).
 func RenderBGScanlineCGB(mem VRAMBankedReader, mapBase uint16, attrsBase uint16, tileData8000 bool, scx, scy, ly byte) (ci [160]byte, pal [160]byte, pri [160]bool) {
 	// Compute BG coordinates
 	bgY := uint16(ly) + uint16(scy)
@@ -175,6 +176,7 @@ func RenderBGScanlineCGB(mem VRAMBankedReader, mapBase uint16, attrsBase uint16,
 }
 
 // RenderWindowScanlineCGB is a CGB-aware window renderer returning BG pixel data + palette/prio.
+// attrsBase must be the bank-1 address corresponding to mapBase (same address value).
 func RenderWindowScanlineCGB(mem VRAMBankedReader, mapBase uint16, attrsBase uint16, tileData8000 bool, wxStart int, winLine byte) (ci [160]byte, pal [160]byte, pri [160]bool) {
 	if wxStart >= 160 {
 		return

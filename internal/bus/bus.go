@@ -17,8 +17,12 @@ import (
 type Bus struct {
 	cart cart.Cartridge
 
-	// Work RAM (WRAM) 8 KiB at 0xC000–0xDFFF; Echo 0xE000–0xFDFF mirrors C000–DDFF.
-	wram [0x2000]byte
+	// Work RAM
+	// DMG: 8 KiB at 0xC000–0xDFFF
+	// CGB: Bank 0 at 0xC000–0xCFFF, switchable bank 1..7 at 0xD000–0xDFFF via SVBK (0xFF70)
+	wram       [0x2000]byte    // used for DMG and bank 0 (0xC000..0xCFFF) and DMG 0xD000..0xDFFF
+	wramBanks  [7][0x1000]byte // CGB WRAM banks 1..7, mapped at 0xD000..0xDFFF
+	wramBankID byte            // current bank id 1..7 for 0xD000..0xDFFF (SVBK low 3 bits; 0 maps to 1)
 
 	// High RAM (HRAM) 0xFF80–0xFFFE (127 bytes)
 	hram [0x7F]byte
@@ -64,11 +68,18 @@ type Bus struct {
 	dmaIndex  int
 
 	// Boot ROM support
-	bootROM     []byte
+	bootROM     []byte // DMG boot (0x100)
+	cgbBootROM  []byte // CGB boot (0x800)
 	bootEnabled bool
+	bootMode    byte // 0=none, 1=DMG, 2=CGB
 
 	// debug
 	debugTimer bool
+
+	// CGB mode exposure
+	cgbMode     bool // if true, expose CGB-only registers and WRAM banking
+	key1        byte // KEY1 prepare bit (bit0); other bits read as per CGB
+	doubleSpeed bool // current speed (ignored, but exposed via KEY1 bit7 when true)
 }
 
 // New constructs a Bus with a ROM-only cartridge for convenience.
@@ -86,6 +97,8 @@ func NewWithCartridge(c cart.Cartridge) *Bus {
 	if os.Getenv("GB_DEBUG_TIMER") != "" {
 		b.debugTimer = true
 	}
+	// Defaults for CGB-related state
+	b.wramBankID = 1 // SVBK bank 1 after boot
 	return b
 }
 
@@ -98,13 +111,37 @@ func (b *Bus) Cart() cart.Cartridge { return b.cart }
 // APU returns the audio processing unit for pulling audio samples.
 func (b *Bus) APU() *apu.APU { return b.apu }
 
+// SetCGBMode exposes or hides CGB-only features (KEY1, SVBK, WRAM banking) to the CPU.
+// When enabled, games can detect CGB hardware and will use CGB palette registers.
+func (b *Bus) SetCGBMode(on bool) {
+	b.cgbMode = on
+	if on {
+		if b.wramBankID == 0 {
+			b.wramBankID = 1
+		}
+	}
+}
+
 func (b *Bus) Read(addr uint16) byte {
 	switch {
 	// Cartridge ROM and External RAM (banked) are handled by the cartridge
 	case addr < 0x8000:
-		// When boot ROM is enabled, it overlays 0x0000-0x00FF
-		if b.bootEnabled && addr < 0x0100 && len(b.bootROM) >= 0x100 {
-			return b.bootROM[addr]
+		// When boot ROM is enabled, overlay boot ranges
+		if b.bootEnabled {
+			if b.bootMode == 1 { // DMG
+				if addr < 0x0100 && len(b.bootROM) >= 0x100 {
+					return b.bootROM[addr]
+				}
+			} else if b.bootMode == 2 { // CGB split mapping: 0000-00FF and 0200-08FF
+				if len(b.cgbBootROM) >= 0x800 {
+					if addr < 0x0100 {
+						return b.cgbBootROM[addr]
+					}
+					if addr >= 0x0200 && addr <= 0x08FF {
+						return b.cgbBootROM[0x100+addr-0x0200]
+					}
+				}
+			}
 		}
 		return b.cart.Read(addr)
 	// VRAM (via PPU)
@@ -113,14 +150,36 @@ func (b *Bus) Read(addr uint16) byte {
 	case addr >= 0xA000 && addr <= 0xBFFF:
 		return b.cart.Read(addr)
 
-	// Work RAM 0xC000–0xDFFF (8 KiB); note upper bound is inclusive 0xDFFF
-	case addr >= 0xC000 && addr <= 0xDFFF:
+	// Work RAM 0xC000–0xDFFF (DMG: 8 KiB). On CGB, 0xC000–0xCFFF is bank 0 and 0xD000–0xDFFF is banked 1..7.
+	case addr >= 0xC000 && addr <= 0xCFFF:
+		return b.wram[addr-0xC000]
+	case addr >= 0xD000 && addr <= 0xDFFF:
+		if b.cgbMode {
+			bank := b.wramBankID
+			if bank == 0 {
+				bank = 1
+			}
+			return b.wramBanks[bank-1][addr-0xD000]
+		}
 		return b.wram[addr-0xC000]
 
 	// Echo RAM 0xE000–0xFDFF mirrors 0xC000–0xDDFF
 	case addr >= 0xE000 && addr <= 0xFDFF:
 		mirror := addr - 0x2000
-		return b.wram[mirror-0xC000]
+		if mirror >= 0xC000 && mirror <= 0xCFFF {
+			return b.wram[mirror-0xC000]
+		}
+		if mirror >= 0xD000 && mirror <= 0xDFFF {
+			if b.cgbMode {
+				bank := b.wramBankID
+				if bank == 0 {
+					bank = 1
+				}
+				return b.wramBanks[bank-1][mirror-0xD000]
+			}
+			return b.wram[mirror-0xC000]
+		}
+		return 0xFF
 
 	// High RAM 0xFF80–0xFFFE (IE at 0xFFFF not covered yet)
 	case addr >= 0xFF80 && addr <= 0xFFFE:
@@ -186,9 +245,31 @@ func (b *Bus) Read(addr uint16) byte {
 	case addr == 0xFF40, addr == 0xFF41, addr == 0xFF42, addr == 0xFF43,
 		addr == 0xFF44, addr == 0xFF45,
 		addr == 0xFF47, addr == 0xFF48, addr == 0xFF49,
-		addr == 0xFF4A, addr == 0xFF4B,
+		addr == 0xFF4A, addr == 0xFF4B, addr == 0xFF4F,
 		addr == 0xFF68, addr == 0xFF69, addr == 0xFF6A, addr == 0xFF6B:
 		return b.ppu.CPURead(addr)
+	// CGB-only: KEY1 and SVBK exposure
+	case addr == 0xFF4D: // KEY1 (CGB only)
+		if !b.cgbMode {
+			return 0xFF
+		}
+		res := byte(0x7E) // bits 6..1 read as 1; bit7 current speed 0; bit0 prepare switch (kept)
+		if b.doubleSpeed {
+			res |= 0x80
+		}
+		if (b.key1 & 0x01) != 0 {
+			res |= 0x01
+		}
+		return res
+	case addr == 0xFF70: // SVBK (CGB only)
+		if !b.cgbMode {
+			return 0xFF
+		}
+		bank := b.wramBankID & 0x07
+		if bank == 0 {
+			bank = 1
+		}
+		return 0xF8 | bank
 	// APU registers (subset): NR10..NR14, NR21..NR24, NR30..NR34, NR41..NR44, NR50..NR52, and wave RAM FF30..FF3F
 	case addr >= 0xFF10 && addr <= 0xFF14,
 		addr >= 0xFF16 && addr <= 0xFF19,
@@ -231,15 +312,36 @@ func (b *Bus) Write(addr uint16, value byte) {
 		return
 
 	// Work RAM
-	case addr >= 0xC000 && addr <= 0xDFFF:
+	case addr >= 0xC000 && addr <= 0xCFFF:
+		b.wram[addr-0xC000] = value
+		return
+	case addr >= 0xD000 && addr <= 0xDFFF:
+		if b.cgbMode {
+			bank := b.wramBankID
+			if bank == 0 {
+				bank = 1
+			}
+			b.wramBanks[bank-1][addr-0xD000] = value
+			return
+		}
 		b.wram[addr-0xC000] = value
 		return
 
 	// Echo RAM mirrors C000–DDFF
 	case addr >= 0xE000 && addr <= 0xFDFF:
 		mirror := addr - 0x2000
-		if mirror >= 0xC000 && mirror <= 0xDDFF {
+		if mirror >= 0xC000 && mirror <= 0xCFFF {
 			b.wram[mirror-0xC000] = value
+		} else if mirror >= 0xD000 && mirror <= 0xDFFF {
+			if b.cgbMode {
+				bank := b.wramBankID
+				if bank == 0 {
+					bank = 1
+				}
+				b.wramBanks[bank-1][mirror-0xD000] = value
+			} else {
+				b.wram[mirror-0xC000] = value
+			}
 		}
 		return
 
@@ -321,9 +423,22 @@ func (b *Bus) Write(addr uint16, value byte) {
 	case addr == 0xFF40, addr == 0xFF41, addr == 0xFF42, addr == 0xFF43,
 		addr == 0xFF44, addr == 0xFF45,
 		addr == 0xFF47, addr == 0xFF48, addr == 0xFF49,
-		addr == 0xFF4A, addr == 0xFF4B,
+		addr == 0xFF4A, addr == 0xFF4B, addr == 0xFF4F,
 		addr == 0xFF68, addr == 0xFF69, addr == 0xFF6A, addr == 0xFF6B:
 		b.ppu.CPUWrite(addr, value)
+		return
+	case addr == 0xFF4D: // KEY1 (CGB only)
+		if b.cgbMode {
+			b.key1 = value & 0x01 // store prepare bit; we don't actually switch speed
+		}
+		return
+	case addr == 0xFF70: // SVBK (CGB only)
+		if b.cgbMode {
+			b.wramBankID = value & 0x07
+			if b.wramBankID == 0 {
+				b.wramBankID = 1
+			}
+		}
 		return
 	// APU registers
 	case addr >= 0xFF10 && addr <= 0xFF14,
@@ -344,9 +459,10 @@ func (b *Bus) Write(addr uint16, value byte) {
 		b.dmaIndex = 0
 		return
 	case addr == 0xFF50:
-		// Any non-zero write disables the boot ROM overlay
+		// Any non-zero write disables the boot ROM overlay (both DMG and CGB)
 		if value != 0x00 {
 			b.bootEnabled = false
+			b.bootMode = 0
 		}
 		return
 	// IO: IF at 0xFF0F
@@ -390,8 +506,36 @@ func (b *Bus) SetBootROM(data []byte) {
 	if len(data) >= 0x100 {
 		b.bootROM = make([]byte, 0x100)
 		copy(b.bootROM, data[:0x100])
-		b.bootEnabled = true
 	}
+}
+
+// SetCGBBootROM loads a CGB boot ROM (0x900 total mapped as 0x100+0x700) used when boot mode is CGB.
+func (b *Bus) SetCGBBootROM(data []byte) {
+	b.cgbBootROM = nil
+	if len(data) >= 0x900 { // some dumps include 0x900 with padding; accept >=0x800 too
+		// keep last 0x800 bytes starting at 0x100 if provided 0x900
+		b.cgbBootROM = make([]byte, 0x800)
+		copy(b.cgbBootROM, data[len(data)-0x800:])
+	} else if len(data) >= 0x800 {
+		b.cgbBootROM = make([]byte, 0x800)
+		copy(b.cgbBootROM, data[:0x800])
+	}
+}
+
+// EnableBoot selects and enables the boot ROM overlay; mode: 1=DMG, 2=CGB; any other disables.
+func (b *Bus) EnableBoot(mode byte) {
+	if mode == 1 && len(b.bootROM) >= 0x100 {
+		b.bootEnabled = true
+		b.bootMode = 1
+		return
+	}
+	if mode == 2 && len(b.cgbBootROM) >= 0x800 {
+		b.bootEnabled = true
+		b.bootMode = 2
+		return
+	}
+	b.bootEnabled = false
+	b.bootMode = 0
 }
 
 // Tick advances timers by the given number of CPU cycles.

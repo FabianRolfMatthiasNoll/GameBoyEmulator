@@ -17,10 +17,14 @@ type PPU struct {
 	oam   [0xA0]byte   // 0xFE00–0xFE9F
 
 	// CGB color palettes (CRAM)
-	bgPal  [64]byte // 8 palettes * 4 colors * 2 bytes
-	objPal [64]byte // same for OBJ
-	bcps   byte     // FF68: BG palette index (bits0-5 addr, bit7 auto-inc)
-	ocps   byte     // FF6A: OBJ palette index
+	bgPal         [64]byte // 8 palettes * 4 colors * 2 bytes
+	objPal        [64]byte // same for OBJ
+	bcps          byte     // FF68: BG palette index (bits0-5 addr, bit7 auto-inc)
+	ocps          byte     // FF6A: OBJ palette index
+	bgPalWritten  bool
+	objPalWritten bool
+	// CGB VRAM bank select for CPU accesses (FF4F VBK)
+	vbk byte // bit0 selects VRAM bank for CPURead/Write
 
 	// regs
 	lcdc byte // FF40
@@ -80,7 +84,11 @@ func (p *PPU) CPURead(addr uint16) byte {
 		if (p.stat & 0x03) == 3 {
 			return 0xFF
 		}
-		return p.vram[addr-0x8000]
+		off := addr - 0x8000
+		if (p.vbk & 0x01) != 0 {
+			return p.vram1[off]
+		}
+		return p.vram[off]
 	case addr >= 0xFE00 && addr <= 0xFE9F:
 		// OAM is inaccessible during modes 2 and 3
 		m := p.stat & 0x03
@@ -111,6 +119,8 @@ func (p *PPU) CPURead(addr uint16) byte {
 		return p.wy
 	case addr == 0xFF4B:
 		return p.wx
+	case addr == 0xFF4F: // VBK
+		return 0xFE | (p.vbk & 0x01)
 	case addr == 0xFF68: // BCPS/BGPI
 		return 0x40 | (p.bcps & 0xBF)
 	case addr == 0xFF69: // BCPD/BGPD
@@ -133,7 +143,12 @@ func (p *PPU) CPUWrite(addr uint16, value byte) {
 		if (p.stat & 0x03) == 3 {
 			return
 		}
-		p.vram[addr-0x8000] = value
+		off := addr - 0x8000
+		if (p.vbk & 0x01) != 0 {
+			p.vram1[off] = value
+		} else {
+			p.vram[off] = value
+		}
 	case addr >= 0xFE00 && addr <= 0xFE9F:
 		m := p.stat & 0x03
 		if m == 2 || m == 3 {
@@ -184,15 +199,22 @@ func (p *PPU) CPUWrite(addr uint16, value byte) {
 		p.wy = value
 	case addr == 0xFF4B:
 		p.wx = value
+	case addr == 0xFF4F: // VBK
+		p.vbk = value & 0x01
 	case addr == 0xFF68: // BCPS/BGPI
 		p.bcps = value & 0xBF // bit6 reads/writes as 0; keep bit7 as auto-inc flag
 	case addr == 0xFF69: // BCPD/BGPD
-		// Ignore writes during Mode 3 (approximation)
+		// During Mode 3, the write fails but auto-increment still occurs (Pan Docs)
 		if (p.stat & 0x03) == 3 {
+			if (p.bcps & 0x80) != 0 {
+				idx := int(p.bcps & 0x3F)
+				p.bcps = (p.bcps & 0xC0) | byte((idx+1)&0x3F)
+			}
 			return
 		}
 		idx := int(p.bcps & 0x3F)
 		p.bgPal[idx] = value
+		p.bgPalWritten = true
 		if (p.bcps & 0x80) != 0 { // auto-increment
 			p.bcps = (p.bcps & 0xC0) | byte((idx+1)&0x3F)
 		}
@@ -200,10 +222,15 @@ func (p *PPU) CPUWrite(addr uint16, value byte) {
 		p.ocps = value & 0xBF
 	case addr == 0xFF6B: // OCPD/OBPD
 		if (p.stat & 0x03) == 3 {
+			if (p.ocps & 0x80) != 0 {
+				idx := int(p.ocps & 0x3F)
+				p.ocps = (p.ocps & 0xC0) | byte((idx+1)&0x3F)
+			}
 			return
 		}
 		idx := int(p.ocps & 0x3F)
 		p.objPal[idx] = value
+		p.objPalWritten = true
 		if (p.ocps & 0x80) != 0 {
 			p.ocps = (p.ocps & 0xC0) | byte((idx+1)&0x3F)
 		}
@@ -403,29 +430,37 @@ func (p *PPU) SCX() byte  { return p.scx }
 func (p *PPU) WY() byte   { return p.wy }
 func (p *PPU) WX() byte   { return p.wx }
 
+// BGPalReady reports whether any BG palette bytes were written (useful to fallback to DMG shading early).
+func (p *PPU) BGPalReady() bool { return p.bgPalWritten }
+
+// OBJPalReady reports whether any OBJ palette bytes were written.
+func (p *PPU) OBJPalReady() bool { return p.objPalWritten }
+
 // --- Save/Load state ---
 type ppuState struct {
-	VRAM     [0x2000]byte
-	VRAM1    [0x2000]byte
-	OAM      [0xA0]byte
-	BGPal    [64]byte
-	OBJPal   [64]byte
-	BCPS     byte
-	OCPS     byte
-	LCDC     byte
-	STAT     byte
-	SCY      byte
-	SCX      byte
-	LY       byte
-	LYC      byte
-	BGP      byte
-	OBP0     byte
-	OBP1     byte
-	WY       byte
-	WX       byte
-	DOT      int
-	LineRegs [154]LineRegs
-	WinLine  byte
+	VRAM          [0x2000]byte
+	VRAM1         [0x2000]byte
+	OAM           [0xA0]byte
+	BGPal         [64]byte
+	OBJPal        [64]byte
+	BCPS          byte
+	OCPS          byte
+	BGPalWritten  bool
+	OBJPalWritten bool
+	LCDC          byte
+	STAT          byte
+	SCY           byte
+	SCX           byte
+	LY            byte
+	LYC           byte
+	BGP           byte
+	OBP0          byte
+	OBP1          byte
+	WY            byte
+	WX            byte
+	DOT           int
+	LineRegs      [154]LineRegs
+	WinLine       byte
 }
 
 func (p *PPU) SaveState() []byte {
@@ -434,6 +469,7 @@ func (p *PPU) SaveState() []byte {
 	s := ppuState{
 		VRAM: p.vram, VRAM1: p.vram1, OAM: p.oam,
 		BGPal: p.bgPal, OBJPal: p.objPal, BCPS: p.bcps, OCPS: p.ocps,
+		BGPalWritten: p.bgPalWritten, OBJPalWritten: p.objPalWritten,
 		LCDC: p.lcdc, STAT: p.stat, SCY: p.scy, SCX: p.scx, LY: p.ly, LYC: p.lyc,
 		BGP: p.bgp, OBP0: p.obp0, OBP1: p.obp1, WY: p.wy, WX: p.wx,
 		DOT: p.dot, LineRegs: p.lineRegs, WinLine: p.winLineCounter,
@@ -455,6 +491,8 @@ func (p *PPU) LoadState(data []byte) {
 	p.objPal = s.OBJPal
 	p.bcps = s.BCPS
 	p.ocps = s.OCPS
+	p.bgPalWritten = s.BGPalWritten
+	p.objPalWritten = s.OBJPalWritten
 	p.lcdc, p.stat, p.scy, p.scx, p.ly, p.lyc = s.LCDC, s.STAT, s.SCY, s.SCX, s.LY, s.LYC
 	p.bgp, p.obp0, p.obp1, p.wy, p.wx = s.BGP, s.OBP0, s.OBP1, s.WY, s.WX
 	p.dot = s.DOT
