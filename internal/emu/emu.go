@@ -3,6 +3,7 @@ package emu
 import (
 	"bytes"
 	"encoding/gob"
+	"errors"
 	"math"
 	"os"
 
@@ -41,6 +42,10 @@ type Machine struct {
 
 	romTitle string // decoded title from header (trimmed)
 }
+
+// ErrStateIncompatibleMode is returned when loading a DMG savestate into a different
+// color mode (DMG vs CGB-compat) than it was created with.
+var ErrStateIncompatibleMode = errors.New("savestate incompatible with current color mode; toggle 'CGB Colors' to match and retry")
 
 // Human-friendly names for the curated DMG-on-CGB compatibility palettes.
 var cgbCompatSetNames = []string{
@@ -681,24 +686,32 @@ func (m *Machine) LoadState(data []byte) error {
 	m.bus.LoadState(s.Bus)
 	m.cpu.LoadState(s.CPU)
 	// Reconcile loaded state with current user color toggle and ROM capability.
-	// Goal: If user has Colors OFF for a DMG ROM, do not force color back ON when loading a colored savestate.
-	// For CGB-capable games, we leave the state as-is (don’t coerce DMG<->CGB at load).
+	// Goals:
+	//  - DMG-only ROMs: require that the current color setting matches the state (no unsafe conversion at load).
+	//  - CGB-capable ROMs: do not attempt to coerce between DMG and CGB via savestate; switching requires a reset.
 	wantColors := m.cfg.UseCGBBG
-	if !wantColors && !m.cgbCapable {
-		// Colors disabled and DMG-only ROM: enforce DMG classic after load.
-		m.cgbCompat = false
-		m.cgbCompatID = 0
-		m.bus.SetCGBMode(false)
-	} else {
-		// Respect the loaded state; enable compat only when user still wants colors.
-		m.cgbCompat = s.CGBCompat && !m.cgbCapable && wantColors
+	if !m.cgbCapable {
+		// DMG-only ROM: reject mismatch to avoid broken state.
+		if wantColors != s.CGBCompat {
+			return ErrStateIncompatibleMode
+		}
+		// Apply exactly the saved mode
+		m.cgbCompat = s.CGBCompat
 		m.cgbCompatID = s.CGBCompatID
 		if m.cgbCompat {
 			m.bus.SetCGBMode(true)
 			m.seedCGBCompatPalettesID(m.cgbCompatID)
-		} else if m.cgbCapable && wantColors {
-			// CGB-capable game with colors on: ensure CGB hardware exposed
+		} else {
+			m.bus.SetCGBMode(false)
+		}
+	} else {
+		// CGB-capable ROM: keep hardware exposure according to user's desire,
+		// but do not attempt state conversion across DMG<->CGB here.
+		if wantColors {
 			m.bus.SetCGBMode(true)
+		} else {
+			m.bus.SetCGBMode(false)
+			m.cgbCompat = false
 		}
 	}
 	return nil

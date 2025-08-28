@@ -860,7 +860,22 @@ func (a *App) saveSlot(slot int) error {
 
 func (a *App) loadSlot(slot int) error {
 	path := a.statePath(slot)
-	return a.m.LoadStateFromFile(path)
+	if err := a.m.LoadStateFromFile(path); err != nil {
+		if err == emu.ErrStateIncompatibleMode {
+			// Inform user how to resolve
+			a.toast("Savestate mode mismatch. Toggle 'CGB Colors' to match and retry.")
+		}
+		return err
+	}
+	// Nudge a few frames to settle timers/interrupts after cross-mode loads
+	for i := 0; i < 2; i++ {
+		a.m.StepFrame()
+	}
+	// Clear any pressed buttons to avoid stuck input from pre-load polling
+	a.m.SetButtons(emu.Buttons{})
+	// Trim/balance audio buffer after a large state load
+	a.m.APUClearAudioLatency()
+	return nil
 }
 
 func (a *App) Layout(outW, outH int) (int, int) {

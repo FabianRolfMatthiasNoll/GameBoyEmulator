@@ -47,7 +47,7 @@ func TestComposeSpriteLinePaletteSelection(t *testing.T) {
 	mem[base+1] = 0x00
 	// Two overlapping sprites at same X; one selects OBP0, the other OBP1; leftmost X rule should pick X=10
 	s0 := Sprite{X: 10, Y: 0, Tile: 0, Attr: 0 << 4, OAMIndex: 2}   // OBP0
-	s1 := Sprite{X: 11, Y: 0, Tile: 0, Attr: 1<<4 | 0, OAMIndex: 1} // OBP1 but appears to the right, shouldn't win at x=10
+	s1 := Sprite{X: 11, Y: 0, Tile: 0, Attr: 1 << 4, OAMIndex: 1} // OBP1 but appears to the right, shouldn't win at x=10
 	var bgci [160]byte
 	ci, pal := ComposeSpriteLineExt(mem, []Sprite{s0, s1}, 0, bgci, false)
 	if ci[10] == 0 {
