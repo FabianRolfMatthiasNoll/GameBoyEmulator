@@ -11,6 +11,9 @@ type Config struct {
 	AudioLowLatency bool   // hard-cap buffering for minimal latency
 	ROMsDir         string // directory to browse for ROMs
 	UseFetcherBG    bool   // render BG via fetcher/FIFO
+	// Visual effects
+	LCDShader    bool   // legacy: apply LCD-like shader (deprecated; use ShaderPreset)
+	ShaderPreset string // off|lcd|crt|ghost
 	// Visual overlay skin
 	ShellOverlay bool   // draw an alpha-blended overlay image over the game view
 	ShellImage   string // path to the overlay image (PNG)
@@ -39,5 +42,13 @@ func (c *Config) Defaults() {
 	// Default overlay path, disabled by default
 	if c.ShellImage == "" {
 		c.ShellImage = "assets/skins/gbc_overlay.png"
+	}
+	// Default shader preset
+	if c.ShaderPreset == "" {
+		if c.LCDShader {
+			c.ShaderPreset = "lcd"
+		} else {
+			c.ShaderPreset = "off"
+		}
 	}
 }

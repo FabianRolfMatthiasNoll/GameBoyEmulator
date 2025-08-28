@@ -165,15 +165,16 @@ func (a *App) updateSettingsMenu() {
 	// 2 Audio Adaptive
 	// 3 Low-Latency
 	// 4 BG Renderer
-	// 5 ROMs Dir
-	// 6 CGB Colors
-	// 7 Compat Palette (if compat)
-	// 8 Shell Overlay
-	// 9 Shell Skin
+	// 5 Shader Preset
+	// 6 ROMs Dir
+	// 7 CGB Colors
+	// 8 Compat Palette (if compat)
+	// 9 Shell Overlay
+	// 10 Shell Skin
 	hasCompat := a.m != nil && a.m.IsCGBCompat()
-	items := 9
+	items := 10
 	if hasCompat {
-		items = 10
+		items = 11
 	}
 	if !a.editingROMDir { // normal navigation when not editing
 		if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) && a.menuIdx > 0 {
@@ -251,7 +252,29 @@ func (a *App) updateSettingsMenu() {
 			}
 			a.saveSettings()
 		}
-	} else if a.menuIdx == 5 { // ROMs Dir edit mode
+	} else if a.menuIdx == 5 && !a.editingROMDir { // Shader preset cycle
+		if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) || inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
+			presets := []string{"off","lcd","crt","ghost"}
+			// find current index
+			idx := 0
+			for i, p := range presets {
+				if strings.ToLower(a.cfg.ShaderPreset) == p {
+					idx = i
+					break
+				}
+			}
+			if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) {
+				idx = (idx - 1 + len(presets)) % len(presets)
+			} else {
+				idx = (idx + 1) % len(presets)
+			}
+			a.cfg.ShaderPreset = presets[idx]
+			// reset/compile shader accordingly
+			a.shader = nil
+			a.ensureShader()
+			a.saveSettings()
+		}
+	} else if a.menuIdx == 6 { // ROMs Dir edit mode
 		if !a.editingROMDir {
 			if inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
 				a.editingROMDir = true
@@ -285,7 +308,7 @@ func (a *App) updateSettingsMenu() {
 				a.romDirInput = a.cfg.ROMsDir
 			}
 		}
-	} else if a.menuIdx == 6 && !a.editingROMDir { // CGB Colors toggle
+	} else if a.menuIdx == 7 && !a.editingROMDir { // CGB Colors toggle
 		if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) || inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
 			if a.m != nil {
 				turnOn := !a.m.WantCGBColors()
@@ -302,7 +325,7 @@ func (a *App) updateSettingsMenu() {
 				}
 			}
 		}
-	} else if a.menuIdx == 7 && hasCompat && !a.editingROMDir { // Compat Palette row
+	} else if a.menuIdx == 8 && hasCompat && !a.editingROMDir { // Compat Palette row
 		if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) {
 			a.m.CycleCompatPalette(-1)
 			pid := a.m.CurrentCompatPalette()
@@ -323,7 +346,7 @@ func (a *App) updateSettingsMenu() {
 				a.saveSettings()
 			}
 		}
-	} else if a.menuIdx == 8 && !a.editingROMDir { // Shell Overlay toggle
+	} else if a.menuIdx == 9 && !a.editingROMDir { // Shell Overlay toggle
 		if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) || inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) || inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
 			a.cfg.ShellOverlay = !a.cfg.ShellOverlay
 			if a.cfg.ShellOverlay {
@@ -332,7 +355,7 @@ func (a *App) updateSettingsMenu() {
 			a.applyWindowSize()
 			a.saveSettings()
 		}
-	} else if a.menuIdx == 9 && !a.editingROMDir { // Shell Skin select
+	} else if a.menuIdx == 10 && !a.editingROMDir { // Shell Skin select
 		if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) {
 			if len(a.shellList) > 0 {
 				a.shellIdx = (a.shellIdx - 1 + len(a.shellList)) % len(a.shellList)

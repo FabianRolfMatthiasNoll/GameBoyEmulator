@@ -166,6 +166,7 @@ func (a *App) drawSettingsMenu(screen *ebiten.Image) {
 		fmt.Sprintf("Audio Adaptive: %s", map[bool]string{true: "On", false: "Off"}[a.cfg.AudioAdaptive]),
 		fmt.Sprintf("Low-Latency Audio: %s", map[bool]string{true: "On", false: "Off"}[a.cfg.AudioLowLatency]),
 		fmt.Sprintf("BG Renderer: %s", map[bool]string{true: "Fetcher", false: "Classic"}[a.cfg.UseFetcherBG]),
+		fmt.Sprintf("Shader: %s", map[string]string{"off":"Off","lcd":"LCD","crt":"CRT","ghost":"Ghost"}[a.cfg.ShaderPreset]),
 		fmt.Sprintf("ROMs Dir: %s", a.truncateText(romDir, a.maxCharsForText(10)-11)),
 		fmt.Sprintf("CGB Colors: %s", map[bool]string{true: "On", false: "Off"}[a.m != nil && a.m.WantCGBColors()]),
 	}

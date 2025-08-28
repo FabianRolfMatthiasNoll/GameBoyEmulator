@@ -23,6 +23,7 @@ type App struct {
 	cfg     Config
 	m       *emu.Machine
 	tex     *ebiten.Image
+	shader  *ebiten.Shader // active shader
 	paused  bool
 	fast    bool
 	turbo   int  // turbo speed multiplier (1=off)
@@ -72,6 +73,9 @@ type App struct {
 	shellImg  *ebiten.Image
 	shellList []string
 	shellIdx  int
+
+	// shader resources
+	ghostTex *ebiten.Image // previous frame for ghosting
 
 	// current logical screen size
 	curW int
@@ -140,6 +144,8 @@ func NewApp(cfg Config, m *emu.Machine) *App {
 		a.loadShell()
 		a.applyWindowSize()
 	}
+	// Precompile shader if a preset is on
+	a.ensureShader()
 	return a
 }
 
@@ -473,7 +479,6 @@ func (a *App) Draw(screen *ebiten.Image) {
 		a.tex = ebiten.NewImage(160, 144)
 	}
 	a.tex.WritePixels(a.m.Framebuffer())
-	var op ebiten.DrawImageOptions
 	dx := (oW - 160) / 2
 	dy := (oH - 144) / 2
 	if dx < 0 {
@@ -482,8 +487,37 @@ func (a *App) Draw(screen *ebiten.Image) {
 	if dy < 0 {
 		dy = 0
 	}
-	op.GeoM.Translate(float64(dx), float64(dy))
-	screen.DrawImage(a.tex, &op)
+	useShader := a.cfg.ShaderPreset != "off"
+	if useShader {
+		// Ensure shader is ready
+		a.ensureShader()
+		if a.shader != nil {
+			// Draw with shader: pass the game image and optional previous frame
+			op := &ebiten.DrawRectShaderOptions{}
+			op.GeoM.Translate(float64(dx), float64(dy))
+			op.Images[0] = a.tex
+			if a.cfg.ShaderPreset == "ghost" && a.ghostTex != nil {
+				op.Images[1] = a.ghostTex
+			}
+			// uniforms may be added later for tuning
+			screen.DrawRectShader(160, 144, a.shader, op)
+			// Update previous-frame buffer for ghosting
+			if a.cfg.ShaderPreset == "ghost" {
+				if a.ghostTex == nil {
+					a.ghostTex = ebiten.NewImage(160, 144)
+				}
+				a.ghostTex.DrawImage(a.tex, nil)
+			}
+		} else {
+			var op ebiten.DrawImageOptions
+			op.GeoM.Translate(float64(dx), float64(dy))
+			screen.DrawImage(a.tex, &op)
+		}
+	} else {
+		var op ebiten.DrawImageOptions
+		op.GeoM.Translate(float64(dx), float64(dy))
+		screen.DrawImage(a.tex, &op)
+	}
 
 	// Stats overlay
 	if a.showStats {
@@ -522,6 +556,126 @@ func (a *App) Draw(screen *ebiten.Image) {
 			a.drawKeysMenu(screen)
 		case "settings":
 			a.drawSettingsMenu(screen)
+		}
+	}
+}
+
+// Simple LCD-like shader with a subtle grid and subpixel mask.
+// Unit is pixels so srcPos is in pixel space.
+const lcdShaderSrc = `
+//kage:unit pixels
+
+package main
+
+// imageSrc0 is the game texture
+
+func mod(a, b float) float {
+	return a - b*floor(a/b)
+}
+
+func Fragment(position vec4, srcPos vec2, color vec4) vec4 {
+	// Base color from source
+	c := imageSrc0At(srcPos)
+	// Apply a light pixel grid: darker every pixel boundary
+	gx := mod(srcPos.x, 1.0)
+	gy := mod(srcPos.y, 1.0)
+	line := 0.0
+	if gx < 0.03 || gy < 0.03 { // thin lines
+		line = 0.10
+	}
+	// Subpixel mask: RGB stripes across x
+	stripe := mod(floor(srcPos.x), 3.0)
+	mask := vec3(0.95,0.95,0.95)
+	if stripe == 0.0 {
+		mask = vec3(1.00,0.92,0.92)
+	} else if stripe == 1.0 {
+		mask = vec3(0.92,1.00,0.92)
+	} else {
+		mask = vec3(0.92,0.92,1.00)
+	}
+	rgb := c.rgb * mask * (1.0 - line)
+	// Very subtle vignette to reduce hard edges
+	sz := imageSrc0Size()
+	uv := srcPos / sz
+	d := distance(uv, vec2(0.5, 0.5))
+	vignette := 1.0 - 0.04*pow(d/0.707, 1.5)
+	rgb *= vignette
+	return vec4(rgb, c.a)
+}
+`
+
+// CRT-like shader: scanlines + slight curvature + subtle bloom
+const crtShaderSrc = `
+//kage:unit pixels
+package main
+
+func Fragment(position vec4, srcPos vec2, color vec4) vec4 {
+	c := imageSrc0At(srcPos)
+	// scanlines every other row
+	if mod(floor(srcPos.y), 2.0) == 0.0 {
+		c.rgb *= 0.88
+	}
+	// very subtle barrel distortion vignette
+	sz := imageSrc0Size()
+	uv := (srcPos / sz) * 2.0 - 1.0
+	r2 := dot(uv, uv)
+	vignette := 1.0 - 0.06*r2
+	c.rgb *= vignette
+	// gentle bloom by sampling 4 neighbors
+	off := vec2(1.0, 1.0)
+	s := imageSrc0At(srcPos + vec2(1.0,0.0)).rgb + imageSrc0At(srcPos + vec2(-1.0,0.0)).rgb +
+		 imageSrc0At(srcPos + vec2(0.0,1.0)).rgb + imageSrc0At(srcPos + vec2(0.0,-1.0)).rgb
+	c.rgb = mix(c.rgb, s/4.0, 0.08)
+	return c
+}
+`
+
+// Ghosting shader: blend current with previous frame to simulate LCD persistence/ghosting
+const ghostShaderSrc = `
+//kage:unit pixels
+package main
+
+func Fragment(position vec4, srcPos vec2, color vec4) vec4 {
+	cur := imageSrc0At(srcPos)
+	prev := imageSrc1At(srcPos)
+	// Blend with previous frame
+	rgb := mix(cur.rgb, prev.rgb, 0.25)
+	return vec4(rgb, cur.a)
+}
+`
+
+// ensureShader compiles/selects the active shader based on preset.
+func (a *App) ensureShader() {
+	preset := strings.ToLower(a.cfg.ShaderPreset)
+	// Back-compat: if legacy flag set, prefer lcd
+	if preset == "" {
+		if a.cfg.LCDShader {
+			preset = "lcd"
+		} else {
+			preset = "off"
+		}
+	}
+	// If off, release shader
+	if preset == "off" {
+		a.shader = nil
+		return
+	}
+	// Determine current shader source by preset
+	var src string
+	switch preset {
+	case "lcd":
+		src = lcdShaderSrc
+	case "crt":
+		src = crtShaderSrc
+	case "ghost":
+		src = ghostShaderSrc
+	default:
+		src = lcdShaderSrc
+	}
+	// If no shader or switching preset, (re)compile
+	if a.shader == nil {
+		if s, err := ebiten.NewShader([]byte(src)); err == nil {
+			a.shader = s
 		}
 	}
 }
