@@ -587,13 +587,26 @@ func (m *Machine) LoadState(data []byte) error {
 	}
 	m.bus.LoadState(s.Bus)
 	m.cpu.LoadState(s.CPU)
-	// Restore compat mode flag and palette, re-seed palettes if needed
-	m.cgbCompat = s.CGBCompat
-	m.cgbCompatID = s.CGBCompatID
-	if m.cgbCompat {
-		// Ensure CGB hardware is exposed and palettes are in CRAM
-		m.bus.SetCGBMode(true)
-		m.seedCGBCompatPalettesID(m.cgbCompatID)
+	// Reconcile loaded state with current user color toggle and ROM capability.
+	// Goal: If user has Colors OFF for a DMG ROM, do not force color back ON when loading a colored savestate.
+	// For CGB-capable games, we leave the state as-is (don’t coerce DMG<->CGB at load).
+	wantColors := m.cfg.UseCGBBG
+	if !wantColors && !m.cgbCapable {
+		// Colors disabled and DMG-only ROM: enforce DMG classic after load.
+		m.cgbCompat = false
+		m.cgbCompatID = 0
+		m.bus.SetCGBMode(false)
+	} else {
+		// Respect the loaded state; enable compat only when user still wants colors.
+		m.cgbCompat = s.CGBCompat && !m.cgbCapable && wantColors
+		m.cgbCompatID = s.CGBCompatID
+		if m.cgbCompat {
+			m.bus.SetCGBMode(true)
+			m.seedCGBCompatPalettesID(m.cgbCompatID)
+		} else if m.cgbCapable && wantColors {
+			// CGB-capable game with colors on: ensure CGB hardware exposed
+			m.bus.SetCGBMode(true)
+		}
 	}
 	return nil
 }
